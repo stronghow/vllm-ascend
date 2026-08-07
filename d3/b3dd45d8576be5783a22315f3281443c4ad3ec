@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "d3b3dd45d8576be5783a22315f3281443c4ad3ec",
+  "prompts": {},
+  "humans": {
+    "h_9ffd816ec5dfdf": {
+      "author": "HowSir_X <zhonghao31@huawei.com>"
+    }
+  }
+}
