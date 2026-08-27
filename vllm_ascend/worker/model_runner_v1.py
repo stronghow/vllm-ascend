@@ -290,7 +290,265 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    debug_kv_cache_token_rows: "list[_KVCacheDebugTokenRow]"
 
+# _KVCacheDebugStat：单层K/V整体统计信息
+# (层名, component(0=K,1=V), 有效slot数量tensor, K/V数值均值tensor, K/V数值方差tensor)
+_KVCacheDebugStat: TypeAlias = tuple[str, int, torch.Tensor, torch.Tensor, torch.Tensor]
+
+# _KVCacheDebugSlotSample：slot采样样本
+# (层名, tensor[sample_num, 4]：每一行 [row, slot, block_id, block_offset])
+_KVCacheDebugSlotSample: TypeAlias = tuple[str, torch.Tensor]
+
+# _KVCacheDebugTokenRow：单条token调试行
+# 元组含义：(batch内row索引, 请求req_id字符串, token在序列中的position位置)
+_KVCacheDebugTokenRow: TypeAlias = tuple[int, str, int]
+
+# _KVCacheDebugWatchedStat：被持续观测的slot逐槽统计
+# (层名, component, slots张量, block_ids张量, offsets张量, 每个slot均值张量, 每个slot方差张量)
+_KVCacheDebugWatchedStat: TypeAlias = tuple[
+    str,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+# _KVCacheDebugSnapshot：一次推理step完整KV调试快照，NamedTuple打包全部调试数据
+class _KVCacheDebugSnapshot(NamedTuple):
+    stats: list[_KVCacheDebugStat]          # 各层K/V整体统计
+    slot_samples: list[_KVCacheDebugSlotSample] # slot采样样本
+    watched_stats: list[_KVCacheDebugWatchedStat] # 跨step观测slot的统计
+    token_rows: list[_KVCacheDebugTokenRow] # token与req/position映射表
+    connector_summary: list[str]           # KV‑Connector跨卡迁移摘要日志
+
+
+class AsyncNPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: LogprobsTensors | None,
+        invalid_req_indices: list[int],
+        async_output_copy_stream: torch.cuda.Stream,
+        vocab_size: int,
+        routed_experts: RoutedExpertsTensors | None = None,
+        # KV Cache调试回调：执行后返回_KVCacheDebugSnapshot
+        kv_cache_stats_fn: Callable[[], _KVCacheDebugSnapshot] | None = None,
+        # NPU stream：用于在推理完成后采集KV统计快照
+        kv_cache_stats_stream: torch.npu.Stream | None = None,
+        # NPU stream：用于NPU tensor异步拷贝到CPU锁页内存
+        kv_cache_copy_stream: torch.npu.Stream | None = None,
+        # 拷贝未就绪时，把当前output加入pending队列的回调函数
+        kv_cache_pending_output_fn: Callable[[Any], None] | None = None,
+    ):
+        # 保存NPU侧原始统计数据（设备张量）
+        self._kv_cache_stats: list[_KVCacheDebugStat] = []
+        # 已经异步拷贝到CPU锁页内存的统计数据
+        self._kv_cache_stats_cpu: list[_KVCacheDebugStat] = []
+        # NPU侧slot采样样本
+        self._kv_cache_slot_samples: list[_KVCacheDebugSlotSample] = []
+        # 拷贝至CPU后的slot采样样本
+        self._kv_cache_slot_samples_cpu: list[_KVCacheDebugSlotSample] = []
+        # NPU侧watch slot统计
+        self._kv_cache_watched_stats: list[_KVCacheDebugWatchedStat] = []
+        # 拷贝至CPU后的watch slot统计
+        self._kv_cache_watched_stats_cpu: list[_KVCacheDebugWatchedStat] = []
+        # token‑req‑position映射
+        self._kv_cache_token_rows: list[_KVCacheDebugTokenRow] = []
+        # KV‑Connector摘要信息
+        self._kv_cache_connector_summary: list[str] = []
+        # pending output入队回调
+        self._kv_cache_pending_output_fn = kv_cache_pending_output_fn
+        # NPU event，标记拷贝到CPU完成
+        self._kv_cache_stats_ready_event: torch.npu.Event | None = None
+        # 标记本批调试日志是否已经打印，避免重复输出
+        self._kv_cache_stats_logged = False
+        super().__init__(
+            model_runner_output=model_runner_output,
+            sampled_token_ids=sampled_token_ids,
+            logprobs_tensors=logprobs_tensors,
+            invalid_req_indices=invalid_req_indices,
+            async_output_copy_stream=async_output_copy_stream,
+            vocab_size=vocab_size,
+            routed_experts=routed_experts,
+        )
+
+        # 如果调试开关没全部开启，直接返回，不做任何采集
+        if (
+            kv_cache_stats_fn is None
+            or kv_cache_stats_stream is None
+            or kv_cache_copy_stream is None
+        ):
+            return
+        # 获取当前正在执行推理的NPU主流
+        producer_stream = torch.npu.current_stream()
+
+        # 切到专门的统计stream执行snapshot采集
+        with torch.npu.stream(kv_cache_stats_stream):
+            # 等待推理主流全部完成，再执行KV Cache快照采集
+            kv_cache_stats_stream.wait_stream(producer_stream)
+            # 执行快照采集，全部张量还在NPU设备上
+            snapshot = kv_cache_stats_fn()
+
+        # 将快照结果保存到实例成员（NPU张量）
+        self._kv_cache_stats = snapshot.stats
+        self._kv_cache_slot_samples = snapshot.slot_samples
+        self._kv_cache_watched_stats = snapshot.watched_stats
+        self._kv_cache_token_rows = snapshot.token_rows
+        self._kv_cache_connector_summary = snapshot.connector_summary
+
+        # 如果快照为空，直接退出，不需要拷贝
+        if (
+            not self._kv_cache_stats
+            and not self._kv_cache_slot_samples
+            and not self._kv_cache_watched_stats
+            and not self._kv_cache_connector_summary
+        ):
+            return
+
+        # 创建NPU Event，标记拷贝到CPU完成
+        self._kv_cache_stats_ready_event = torch.npu.Event()
+
+        # 切到拷贝专用stream，执行NPU→CPU异步拷贝
+        with torch.npu.stream(kv_cache_copy_stream):
+            # 等待统计采集stream执行完毕再开始拷贝
+            kv_cache_copy_stream.wait_stream(kv_cache_stats_stream)
+
+            # 遍历整体统计，逐个张量异步拷贝CPU锁页内存
+            for layer_name, component, slots, mean, var in self._kv_cache_stats:
+                self._kv_cache_stats_cpu.append(
+                    (
+                        layer_name,
+                        component,
+                        self._async_copy_tensor_to_cpu(slots),
+                        self._async_copy_tensor_to_cpu(mean),
+                        self._async_copy_tensor_to_cpu(var),
+                    )
+                )
+
+            # 拷贝slot采样样本张量
+            for layer_name, sample in self._kv_cache_slot_samples:
+                self._kv_cache_slot_samples_cpu.append(
+                    (layer_name, self._async_copy_tensor_to_cpu(sample))
+                )
+
+            # 拷贝watched slot统计张量
+            for layer_name, component, slots, blocks, offsets, means, vars in self._kv_cache_watched_stats:
+                self._kv_cache_watched_stats_cpu.append(
+                    (
+                        layer_name,
+                        component,
+                        self._async_copy_tensor_to_cpu(slots),
+                        self._async_copy_tensor_to_cpu(blocks),
+                        self._async_copy_tensor_to_cpu(offsets),
+                        self._async_copy_tensor_to_cpu(means),
+                        self._async_copy_tensor_to_cpu(vars),
+                    )
+                )
+            # 在拷贝流上记录event，拷贝完成后event变为可查询状态
+            self._kv_cache_stats_ready_event.record()
+
+    @staticmethod
+    def _async_copy_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        """异步把NPU tensor拷贝到CPU锁页内存，non_blocking，不阻塞NPU流"""
+        # 分配CPU锁页内存，PIN_MEMORY为平台开关，NPU支持DMA直接访问
+        cpu_tensor = torch.empty_like(
+            tensor,
+            device="cpu",
+            pin_memory=PIN_MEMORY,  # 锁页内存，non_blocking拷贝
+        )
+        # non_blocking=True：异步拷贝，依赖NPU stream同步event，不能马上访问cpu_tensor
+        cpu_tensor.copy_(tensor, non_blocking=True)
+        return cpu_tensor
+
+    def try_log_kv_cache_stats(self) -> bool:
+        """尝试打印KV调试日志；返回True：已打印/无需打印；False：NPU→CPU拷贝还未完成"""
+        # 已经打印过，直接返回True
+        if self._kv_cache_stats_logged:
+            return True
+        # 没有event代表没有开启调试，标记已打印返回True
+        if self._kv_cache_stats_ready_event is None:
+            self._kv_cache_stats_logged = True
+            return True
+        # 查询NPU event，拷贝未完成直接返回False，上层加入pending队列
+        if not self._kv_cache_stats_ready_event.query():
+            return False
+
+        # -------- 走到这里：NPU→CPU拷贝全部完成，可以在CPU侧访问tensor.item() --------
+        # 打印每层K/V整体统计日志
+        for layer_name, component, slots, mean, var in self._kv_cache_stats_cpu:
+            num_slots = int(slots.item())
+            if num_slots == 0:
+                continue
+            logger.info(
+                "KV cache debug stats: layer=%s component=%d slots=%d mean=%g var=%g",
+                layer_name,
+                component,
+                num_slots,
+                float(mean.item()),
+                float(var.item()),
+            )
+
+        # 打印KV‑Connector跨卡迁移摘要
+        for summary in self._kv_cache_connector_summary:
+            logger.info("KV cache debug connector: %s", summary)
+
+        # 构建token行映射字典：key=batch_row，value=(req_id, position)
+        token_rows = {
+            row: (req_id, position)
+            for row, req_id, position in self._kv_cache_token_rows
+        }
+        # 打印slot采样样本日志：row/slot/block/offset以及对应req_id、token位置
+        for layer_name, sample in self._kv_cache_slot_samples_cpu:
+            for row, slot, block_id, block_offset in sample.tolist():
+                req_id, position = token_rows.get(row, ("<unknown>", -1))
+                logger.info(
+                    "KV cache debug slot: layer=%s row=%d req_id=%s pos=%d slot=%d block=%d offset=%d",
+                    layer_name,
+                    row,
+                    req_id,
+                    position,
+                    slot,
+                    block_id,
+                    block_offset,
+                )
+
+        # 打印watched slot逐槽统计，观察多轮同一个slot数值变化
+        for layer_name, component, slots, blocks, offsets, means, vars in self._kv_cache_watched_stats_cpu:
+            for slot, block_id, block_offset, mean, var in zip(
+                slots.tolist(),
+                blocks.tolist(),
+                offsets.tolist(),
+                means.tolist(),
+                vars.tolist(),
+            ):
+                logger.info(
+                    "KV cache debug watched: layer=%s component=%d slot=%d block=%d offset=%d mean=%g var=%g",
+                    layer_name,
+                    component,
+                    slot,
+                    block_id,
+                    block_offset,
+                    mean,
+                    var,
+                )
+
+        # 标记日志已经输出，避免重复打印
+        self._kv_cache_stats_logged = True
+        return True
+
+    def get_output(self) -> ModelRunnerOutput:
+        output = super().get_output()
+        # 尝试输出日志；如果拷贝未就绪，调用回调把自身加入pending输出队列
+        if (
+            not self.try_log_kv_cache_stats()
+            and self._kv_cache_pending_output_fn is not None
+        ):
+            self._kv_cache_pending_output_fn(self)
+        return output
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -344,6 +602,14 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        # 保存上一轮step的slot样本，用于下一轮做watched slot观测
+        self._debug_kv_cache_previous_slot_samples: dict[str, torch.Tensor] = {}
+        # pending输出队列：存放NPU拷贝还未完成的AsyncNPUModelRunnerOutput对象
+        self._debug_kv_cache_pending_outputs: list[AsyncNPUModelRunnerOutput] = []
+        # KV Cache快照采集专用NPU stream，懒初始化
+        self._debug_kv_cache_stats_stream: torch.npu.Stream | None = None
+        # NPU→CPU拷贝专用NPU stream，懒初始化
+        self._debug_kv_cache_copy_stream: torch.npu.Stream | None = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -720,6 +986,470 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(self.model, (ACLGraphWrapper, BreakableACLGraphWrapper)):
             return self.model.unwrap()
         return self.model
+
+    def _get_debug_kv_cache_stats_max_layers(self) -> int:
+        """读取配置：debug_kv_cache_stats_max_layers，最多统计多少层KV Cache"""
+        additional_config = self.vllm_config.additional_config or {}
+        if additional_config.get("debug_kv_cache_stats") is not True:
+            return 0
+        max_layers = additional_config.get("debug_kv_cache_stats_max_layers", 1)
+        if not isinstance(max_layers, int) or isinstance(max_layers, bool):
+            return 1
+        return max(max_layers, 0)
+
+    def _get_debug_kv_cache_stats_max_tokens(self) -> int:
+        """读取配置：debug_kv_cache_stats_max_tokens，最多采样多少个token做样本"""
+        additional_config = self.vllm_config.additional_config or {}
+        max_tokens = additional_config.get("debug_kv_cache_stats_max_tokens", 8)
+        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
+            return 8
+        return max(max_tokens, 0)
+
+    def _should_collect_kv_cache_stats(self) -> bool:
+        """判断是否本step需要采集KV Cache调试统计：开启异步调度 && max_layers>0"""
+        return (
+            self.use_async_scheduling
+            and self._get_debug_kv_cache_stats_max_layers() > 0
+        )
+
+    def _get_debug_kv_cache_streams(
+        self,
+    ) -> tuple[torch.npu.Stream, torch.npu.Stream]:
+        """懒创建/获取KV debug需要的两个独立NPU stream，返回(stats_stream, copy_stream)"""
+        if self._debug_kv_cache_stats_stream is None:
+            self._debug_kv_cache_stats_stream = torch.npu.Stream()
+        if self._debug_kv_cache_copy_stream is None:
+            self._debug_kv_cache_copy_stream = torch.npu.Stream()
+        return self._debug_kv_cache_stats_stream, self._debug_kv_cache_copy_stream
+
+    def _add_pending_debug_kv_cache_output(
+        self,
+        output: AsyncNPUModelRunnerOutput,
+    ) -> None:
+        """
+        当output的NPU拷贝还未完成时，加入pending队列；
+        限制队列只保留最近2个，防止队列无限膨胀
+        """
+        # 如果已经可以打印，直接返回，不加入pending
+        if output.try_log_kv_cache_stats():
+            return
+        self._debug_kv_cache_pending_outputs.append(output)
+        # 只保留末尾2个，限制pending队列长度，避免内存累积
+        self._debug_kv_cache_pending_outputs = self._debug_kv_cache_pending_outputs[-2:]
+
+    def _drain_ready_debug_kv_cache_outputs(self) -> None:
+        """
+        drain：处理pending队列里的output；轮询event，能打印就打印，不能打印继续留在pending
+        每个execute_model开头调用，消费上一轮遗留的pending outputs
+        """
+        pending_outputs = []
+        for output in self._debug_kv_cache_pending_outputs:
+            # try_log_kv_cache_stats返回False：拷贝未就绪，继续留在pending
+            if not output.try_log_kv_cache_stats():
+                pending_outputs.append(output)
+        # 更新pending列表，只保留还没就绪的output
+        self._debug_kv_cache_pending_outputs = pending_outputs
+
+    @staticmethod
+    def _format_debug_value(value: Any, max_items: int = 8) -> str:
+        """通用格式化工具函数：把tensor/np/list/dict转为可读调试字符串，限制输出元素个数"""
+        if value is None:
+            return "None"
+        if isinstance(value, torch.Tensor):
+            return f"Tensor(shape={tuple(value.shape)}, device={value.device}, dtype={value.dtype})"
+        if isinstance(value, np.ndarray):
+            return str(value[:max_items].tolist())
+        if isinstance(value, (list, tuple)):
+            items = [
+                NPUModelRunner._format_debug_value(item, max_items)
+                for item in value[:max_items]
+            ]
+            suffix = "" if len(value) <= max_items else f"...(+{len(value) - max_items})"
+            return f"{items}{suffix}"
+        if isinstance(value, dict):
+            keys = list(value)[:max_items]
+            suffix = "" if len(value) <= max_items else f"...(+{len(value) - max_items})"
+            return (
+                "{"
+                + ", ".join(
+                    f"{key}: {NPUModelRunner._format_debug_value(value[key], max_items)}"
+                    for key in keys
+                )
+                + "}"
+                + suffix
+            )
+        return str(value)
+
+    def _summarize_debug_kv_connector_metadata(self, scheduler_output: "SchedulerOutput") -> list[str]:
+        """提取scheduler_output.kv_connector_metadata，格式化输出文本摘要，用于快照connector_summary"""
+        metadata = getattr(scheduler_output, "kv_connector_metadata", None)
+        if metadata is None:
+            return ["metadata=None"]
+
+        max_items = self._get_debug_kv_cache_stats_max_tokens()
+        summary = [f"type={type(metadata).__name__}"]
+        if self.is_kv_producer and not self.is_kv_consumer:
+            summary.append("role=P(prefill)")
+        elif self.is_kv_consumer and not self.is_kv_producer:
+            summary.append("role=D(decode)")
+        elif self.is_kv_producer and self.is_kv_consumer:
+            summary.append("role=PD(mixed)")
+        requests = getattr(metadata, "requests", None)
+        if isinstance(requests, dict):
+            for req_id, req_meta in list(requests.items())[:max_items]:
+                fields = []
+                for name in (
+                    "local_block_ids",
+                    "remote_block_ids",
+                    "block_ids_by_group",
+                    "allocated_block_ids_by_group",
+                    "local_computed_tokens",
+                    "local_transed_tokens",
+                    "remote_cache_tokens",
+                    "chunk_finish",
+                ):
+                    if hasattr(req_meta, name):
+                        fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
+                summary.append(f"req_id={req_id} " + " ".join(fields))
+
+        send_task = getattr(metadata, "send_task", None)
+        if send_task is not None:
+            fields = []
+            for name in (
+                "layer_name",
+                "layer_idx",
+                "group_rearrange_block_ids",
+                "group_num_blocks",
+                "group_num_tokens",
+            ):
+                if hasattr(send_task, name):
+                    fields.append(f"{name}={self._format_debug_value(getattr(send_task, name))}")
+            summary.append("send_task " + " ".join(fields))
+            send_request = getattr(send_task, "send_request", None)
+            if isinstance(send_request, dict):
+                for req_id, req_meta in list(send_request.items())[:max_items]:
+                    fields = []
+                    for name in (
+                        "local_block_ids",
+                        "remote_block_ids",
+                        "local_computed_tokens",
+                        "local_transed_tokens",
+                    ):
+                        if hasattr(req_meta, name):
+                            fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
+                    summary.append(f"send_req_id={req_id} " + " ".join(fields))
+        return summary
+
+    def _make_debug_token_rows(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+    ) -> list[_KVCacheDebugTokenRow]:
+        """生成token_rows：sample一部分token，得到(batch_row, req_id, token_pos)映射列表，host侧list"""
+        max_tokens = self._get_debug_kv_cache_stats_max_tokens()
+        # 配置采样数为0或没有调度token，直接返回空列表
+        if max_tokens == 0 or total_num_scheduled_tokens == 0:
+            return []
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        # 将每个req按照调度token数目重复，得到每个token对应的req索引
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens[:num_reqs])
+        # 实际采样数量取三者最小值，防止越界
+        sample_count = min(max_tokens, total_num_scheduled_tokens, len(req_indices))
+        # 读取预分配的position buffer
+        positions = self._positions_np_buf[:sample_count]
+        # 组装每一行元组返回
+        return [(row, req_ids[int(req_indices[row])], int(positions[row])) for row in range(sample_count)]
+
+    @staticmethod
+    def _get_debug_slot_mapping(attn_metadata: Any) -> torch.Tensor | None:
+        """从attn_metadata / decode / prefill子元数据提取slot_mapping；
+        如果是(block_id,offset)二维格式，转换成flat全局slot编号，返回一维slot_mapping tensor；没有返回None
+        """
+        slots: list[torch.Tensor] = []
+        for metadata in (
+                attn_metadata, getattr(attn_metadata, "decode", None), getattr(attn_metadata, "prefill", None),
+        ):
+            if metadata is None:
+                continue
+            slot_mapping = getattr(metadata, "slot_mapping", None)
+            if not isinstance(slot_mapping, torch.Tensor):
+                continue
+            # slot_mapping形状最后一维=2，代表[block_id, block_offset]编码格式
+            if slot_mapping.ndim > 1 and slot_mapping.shape[-1] == 2:
+                block_size = getattr(metadata, "block_size", None)
+                if not isinstance(block_size, int) or block_size <= 0:
+                    continue
+                slot_mapping = slot_mapping.to(torch.long)
+                # block_id * block_size + offset，展开为全局flat slot index
+                slot_mapping = slot_mapping[..., 0] * block_size + slot_mapping[..., 1]
+                slots.append(slot_mapping.reshape(-1))
+        if not slots:
+            return None
+        return torch.cat(slots) if len(slots) > 1 else slots[0]
+
+    def _get_debug_layer_slots(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        layer_name: str,
+    ) -> torch.Tensor | None:
+        """按layer_name从PerLayerAttnMetadata取出该层的flat slot_mapping，返回一维tensor；无返回None"""
+        metadata_dicts = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        slots = []
+        for metadata_dict in metadata_dicts:
+            metadata = metadata_dict.get(layer_name)
+            if metadata is None:
+                continue
+            slot_mapping = self._get_debug_slot_mapping(metadata)
+            if slot_mapping is not None:
+                slots.append(slot_mapping)
+        if not slots:
+            return None
+        return torch.cat(slots) if len(slots) > 1 else slots[0]
+
+    @staticmethod
+    def _get_debug_kv_cache_components(kv_cache: Any) -> tuple[torch.Tensor | None, ...]:
+        """解析kv_cache对象，提取K、V张量；兼容多层嵌套list/tuple包装格式"""
+        if isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 1 and isinstance(kv_cache[0], (list, tuple)):
+            kv_cache = kv_cache[0]
+        if isinstance(kv_cache, torch.Tensor):
+            return (kv_cache,)
+        if isinstance(kv_cache, (list, tuple)):
+            return tuple[Any, ...](kv_cache[:2])
+        return ()
+
+    @staticmethod
+    def _collect_debug_tensor_stats(
+        layer_name: str,
+        component: int,
+        cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> _KVCacheDebugStat | None:
+        """
+        NPU侧计算本层K/V cache在slot_mapping指向的有效slot上的统计：有效slot数、均值、方差
+        全部运算NPU完成，返回_KVCacheDebugStat元组；异常返回None
+        """
+        # cache维度不足2或者空tensor，直接返回None
+        if cache.ndim < 2 or cache.numel() == 0:
+            return None
+        block_size = cache.shape[1]
+        if block_size <= 0:
+            return None
+        # slot_mapping必须在设备侧，CPU直接丢弃
+        if slot_mapping.device.type == "cpu":
+            return None
+        # 将slot_mapping迁移到cache所在设备，转为long一维
+        slot_mapping = slot_mapping.to(cache.device, non_blocking=True).to(torch.long).reshape(-1)
+        if slot_mapping.numel() == 0:
+            return None
+        # 计算全局最大slot编号
+        max_slot = cache.shape[0] * block_size
+        # slot排序，用于去重，同一个slot只统计一次
+        sorted_slots = torch.sort(slot_mapping).values
+        # slot合法性校验 >=0 且 <max_slot
+        valid = (sorted_slots >= 0) & (sorted_slots < max_slot)
+        # first_occurrence标记：标记排序后第一次出现的slot，实现slot去重
+        first_occurrence = torch.ones_like(valid)
+        first_occurrence[1:] = sorted_slots[1:] != sorted_slots[:-1]
+        valid = valid & first_occurrence
+        # clamp防止越界索引cache
+        safe_slots = sorted_slots.clamp(0, max_slot - 1)
+        # 由全局slot编号反解block_id与block_offset
+        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+        block_offsets = safe_slots % block_size
+        # 取出cache对应位置的值，转float用于统计
+        values = cache[block_ids, block_offsets].float().reshape(slot_mapping.numel(), -1)
+        # valid转为dtype与values一致的mask
+        mask = valid.to(values.dtype).unsqueeze(-1)
+        masked_values = values * mask
+        # 有效slot总个数
+        slots = valid.sum(dtype=torch.int64)
+        # 分母：有效元素总数量，clamp_min防止除0
+        denominator = slots.to(torch.float32) * values.shape[1]
+        denominator = denominator.clamp_min(1.0)
+        # 加权求均值
+        mean = masked_values.sum() / denominator
+        # 方差公式：E[x²] - (E[x])²，clamp_min保证方差>=0
+        var = (masked_values.square().sum() / denominator - mean.square()).clamp_min(0.0)
+        return (layer_name, component, slots, mean, var)
+
+    @staticmethod
+    def _collect_debug_watched_tensor_stats(
+        layer_name: str,
+        component: int,
+        cache: torch.Tensor,
+        watched_slots: torch.Tensor | None,
+    ) -> _KVCacheDebugWatchedStat | None:
+        """
+        NPU侧：对指定一批watched_slots，逐slot计算每个slot内部feature维度的mean/var；
+        返回包含slot/block_id/offset/means/vars的元组；异常返回None
+        """
+        if (cache.ndim < 2
+                or cache.numel() == 0
+                or watched_slots is None
+                or watched_slots.numel() == 0
+        ):
+            return None
+        block_size = cache.shape[1]
+        if block_size <= 0:
+            return None
+        max_slot = cache.shape[0] * block_size
+        # watched_slots迁移到cache设备，转为long一维
+        slots = watched_slots.to(cache.device, non_blocking=True).to(torch.long).reshape(-1)
+        # slot合法性判断
+        valid = (slots >= 0) & (slots < max_slot)
+        safe_slots = slots.clamp(0, max_slot - 1)
+        # slot反解block_id、offset
+        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+        block_offsets = safe_slots % block_size
+        # 取出cache对应位置
+        values = cache[block_ids, block_offsets].float().reshape(slots.numel(), -1)
+        if values.shape[1] == 0:
+            return None
+        # 在每个slot的feature维度上求均值、方差
+        means = values.mean(dim=1)
+        vars = (values.square().mean(dim=1) - means.square()).clamp_min(0.0)
+        zeros = torch.zeros_like(means)
+        # 非法slot位置置0
+        means = torch.where(valid, means, zeros)
+        vars = torch.where(valid, vars, zeros)
+        # 非法slot的block_id、offset填‑1
+        invalid_slots = torch.full_like(slots, -1)
+        block_ids = torch.where(valid, block_ids, invalid_slots)
+        block_offsets = torch.where(valid, block_offsets, invalid_slots)
+        return (layer_name, component, slots, block_ids, block_offsets, means, vars)
+
+    @staticmethod
+    def _make_debug_slot_sample(
+            layer_name: str, slot_mapping: torch.Tensor, block_size: int, max_slot: int, sample_count: int,
+    ) -> _KVCacheDebugSlotSample | None:
+        """
+        从slot_mapping取前sample_count个slot，组装[row, slot, block_id, block_offset]二维tensor样本；
+        用于日志打印；返回None代表失败
+        """
+        if sample_count == 0 or max_slot <= 0 or slot_mapping.device.type == "cpu":
+            return None
+        slot_mapping = slot_mapping.to(torch.long).reshape(-1)
+        sample_count = min(sample_count, slot_mapping.numel())
+        if sample_count == 0:
+            return None
+        # 取前sample_count个slot
+        slots = slot_mapping[:sample_count]
+        valid_slots = (slots >= 0) & (slots < max_slot)
+        safe_slots = slots.clamp(0, max_slot - 1)
+        # row为样本内部序号0~sample_count‑1
+        rows = torch.arange(sample_count, device=slots.device, dtype=torch.long)
+        invalid_value = torch.full_like(safe_slots, -1)
+        # 反解block_id，非法slot填‑1
+        blocks = torch.where(
+            valid_slots, torch.div(safe_slots, block_size, rounding_mode="floor"),
+            invalid_value,
+        )
+        # 反解block offset，非法slot填‑1
+        offsets = torch.where(valid_slots, safe_slots % block_size, invalid_value)
+        # 按dim=1堆叠：[row, slot, block, offset]
+        return layer_name, torch.stack((rows, slots, blocks, offsets), dim=1)
+
+    def _make_debug_kv_cache_snapshot(
+            self, attn_metadata: PerLayerAttnMetadata, scheduler_output: "SchedulerOutput",
+            token_rows: list[_KVCacheDebugTokenRow],
+    ) -> _KVCacheDebugSnapshot:
+        """
+        主快照生成函数：遍历层，采集统计、slot样本、watched slot统计、connector摘要；
+        全部计算在NPU设备；返回_KVCacheDebugSnapshot，tensor驻留NPU
+        """
+        # 判断是否开启采集；未开启直接返回空快照
+        if not self._should_collect_kv_cache_stats():
+            return _KVCacheDebugSnapshot([], [], [], [], [])
+        max_layers = self._get_debug_kv_cache_stats_max_layers()
+        stats: list[_KVCacheDebugStat] = []
+        slot_samples: list[_KVCacheDebugSlotSample] = []
+        watched_stats: list[_KVCacheDebugWatchedStat] = []
+        # 上一轮保存的slot样本，用来生成本轮watched_slots
+        previous_slot_samples = self._debug_kv_cache_previous_slot_samples
+        # 保存本轮新的slot样本，给下一轮作为watched输入
+        next_previous_slot_samples: dict[str, torch.Tensor] = {}
+        # cache ptr集合，去重：同一个物理KV cache只统计一次
+        seen_cache_ptrs: set[tuple[int, ...]] = set()
+        unique_layers = 0
+
+        # 遍历static_forward_context里面的模块
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            # Mamba层跳过，只处理Attention KV Cache
+            if isinstance(module, MambaBase):
+                continue
+            # 提取K/V cache张量
+            components = self._get_debug_kv_cache_components(getattr(module, "kv_cache", None))
+            tensor_components = [component for component in components if isinstance(component, torch.Tensor)]
+            if not tensor_components:
+                continue
+            # 用data_ptr判断是否是同一个物理KV cache，做去重
+            cache_ptrs = tuple(component.data_ptr() for component in tensor_components)
+            if cache_ptrs in seen_cache_ptrs:
+                continue
+            # 获取本层slot_mapping
+            slot_mapping = self._get_debug_layer_slots(attn_metadata, layer_name)
+            # 从上一轮样本取出watched_slots（取样本里的slot列）
+            watched_sample = previous_slot_samples.get(layer_name)
+            watched_slots = (
+                watched_sample[:, 1]
+                if watched_sample is not None and watched_sample.ndim == 2 and watched_sample.shape[1] >= 2
+                else None
+            )
+            has_watched_slots = (
+                    watched_slots is not None and watched_slots.numel() > 0
+            )
+            # 既没有slot_mapping也没有watched_slots，跳过本层
+            if slot_mapping is None and not has_watched_slots:
+                continue
+
+            layer_stats: list[_KVCacheDebugStat] = []
+            sample_cache = next((component for component in components if isinstance(component, torch.Tensor)), None)
+            # 生成slot采样样本，保存到next_previous_slot_samples供下一轮使用
+            if slot_mapping is not None and sample_cache is not None and sample_cache.ndim >= 2:
+                sample = self._make_debug_slot_sample(
+                    layer_name, slot_mapping, sample_cache.shape[1],
+                    sample_cache.shape[0] * sample_cache.shape[1],
+                    len(token_rows),
+                )
+                if sample is not None:
+                    slot_samples.append(sample)
+                    next_previous_slot_samples[layer_name] = sample[1]
+
+            # 遍历K、V两个component，分别做统计
+            for component, cache in enumerate(components):
+                if not isinstance(cache, torch.Tensor):
+                    continue
+                # 有slot_mapping，计算本component整体统计
+                if slot_mapping is not None:
+                    stat = self._collect_debug_tensor_stats(layer_name, component, cache, slot_mapping)
+                    if stat is not None:
+                        layer_stats.append(stat)
+                # 如果存在watched_slots，做定点slot统计
+                watched_stat = self._collect_debug_watched_tensor_stats(
+                    layer_name, component, cache, watched_slots,
+                )
+                if watched_stat is not None:
+                    watched_stats.append(watched_stat)
+
+            # 当前层没有任何统计结果，跳过
+            if not layer_stats and not has_watched_slots:
+                continue
+            # 标记该cache已经处理过，避免重复统计
+            seen_cache_ptrs.add(cache_ptrs)
+            stats.extend(layer_stats)
+            unique_layers += 1
+            # 达到max_layers配置上限，停止遍历后续层
+            if unique_layers >= max_layers:
+                break
+
+        # 更新实例成员，保存本轮slot样本，下一轮作为watched输入
+        self._debug_kv_cache_previous_slot_samples = next_previous_slot_samples
+        # 组装完整快照对象返回；connector_summary调用元数据格式化函数
+        return _KVCacheDebugSnapshot(
+            stats, slot_samples, watched_stats, token_rows,
+            self._summarize_debug_kv_connector_metadata(scheduler_output),
+        )
 
     def _is_pd_prefill_worker(self) -> bool:
         return self.is_kv_producer and not self.is_kv_consumer
@@ -1925,7 +2655,13 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
-
+                debug_kv_cache_token_rows = []
+                # 如果开启KV debug，生成本次step的token_rows元数据
+                if self._should_collect_kv_cache_stats():
+                    debug_kv_cache_token_rows = self._make_debug_token_rows(
+                        num_scheduled_tokens_np,
+                        total_num_scheduled_tokens,
+                    )
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -2197,6 +2933,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                debug_kv_cache_token_rows,  # 存入ExecuteModelState NamedTuple
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2243,6 +2980,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            debug_kv_cache_token_rows,  # 从execute_model_state取出
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2427,7 +3165,22 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
-        async_output = AsyncGPUModelRunnerOutput(
+        kv_cache_stats_fn = None
+        kv_cache_stats_stream = None
+        kv_cache_copy_stream = None
+        # 如果开启KV Cache统计，先drain上一轮pending outputs，再获取streams，partial包装快照函数
+        if self._should_collect_kv_cache_stats():
+            self._drain_ready_debug_kv_cache_outputs()
+            kv_cache_stats_stream, kv_cache_copy_stream = self._get_debug_kv_cache_streams()
+            kv_cache_stats_fn = partial(
+                self._make_debug_kv_cache_snapshot,
+                attn_metadata,
+                scheduler_output,
+                debug_kv_cache_token_rows,
+            )
+        # 根据是否有kv_cache_stats_fn选择输出类：AsyncNPUModelRunnerOutput / 父类
+        async_output_cls = AsyncNPUModelRunnerOutput if kv_cache_stats_fn else AsyncGPUModelRunnerOutput
+        async_output = async_output_cls(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -2435,6 +3188,17 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
             routed_experts=routed_experts_snapshot,
+            # 只有开启debug时，才传入kv cache相关参数
+            **(
+                {
+                    "kv_cache_stats_fn": kv_cache_stats_fn,
+                    "kv_cache_stats_stream": kv_cache_stats_stream,
+                    "kv_cache_copy_stream": kv_cache_copy_stream,
+                    "kv_cache_pending_output_fn": self._add_pending_debug_kv_cache_output,
+                }
+                if kv_cache_stats_fn
+                else {}
+            ),
         )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
