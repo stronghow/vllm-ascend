@@ -325,6 +325,10 @@ class _KVCacheDebugSnapshot(NamedTuple):
     connector_summary: list[str]           # KV‑Connector跨卡迁移摘要日志
 
 
+# 踩踏检测阈值：watched slot跨step均值/方差变化超过该阈值即视为数值被改写
+_DEBUG_KV_CACHE_STOMP_EPS: float = 1e-6
+
+
 class AsyncNPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
         self,
@@ -343,6 +347,8 @@ class AsyncNPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         kv_cache_copy_stream: torch.npu.Stream | None = None,
         # 拷贝未就绪时，把当前output加入pending队列的回调函数
         kv_cache_pending_output_fn: Callable[[Any], None] | None = None,
+        # 跨step踩踏检测回调：输入CPU侧watched统计，对比输出被异常改写的slot
+        kv_cache_stomp_check_fn: Callable[[list[_KVCacheDebugWatchedStat]], None] | None = None,
     ):
         # 保存NPU侧原始统计数据（设备张量）
         self._kv_cache_stats: list[_KVCacheDebugStat] = []
@@ -604,6 +610,12 @@ class NPUModelRunner(GPUModelRunner):
         self.attn_state: AscendAttentionState | None = None
         # 保存上一轮step的slot样本，用于下一轮做watched slot观测
         self._debug_kv_cache_previous_slot_samples: dict[str, torch.Tensor] = {}
+        # 上一轮step每个请求的transed/computed tokens，用于connector摘要的跨step差值
+        self._debug_kv_cache_prev_trans_info: dict[str, tuple[int, int]] = {}
+        # 上一轮step watched slot数值指纹，用于跨step踩踏检测
+        self._debug_kv_cache_prev_watched_values: dict[
+            tuple[str, int, int, int], tuple[int, float, float]
+        ] = {}
         # pending输出队列：存放NPU拷贝还未完成的AsyncNPUModelRunnerOutput对象
         self._debug_kv_cache_pending_outputs: list[AsyncNPUModelRunnerOutput] = []
         # KV Cache快照采集专用NPU stream，懒初始化
@@ -1096,6 +1108,10 @@ class NPUModelRunner(GPUModelRunner):
             summary.append("role=PD(mixed)")
         requests = getattr(metadata, "requests", None)
         if isinstance(requests, dict):
+            # 保存本轮transed/computed tokens，下一轮输出跨step差值：
+            # P端分块发送时transed_tokens应持续增长，跨step停滞即发送异常的定界证据
+            previous_trans_info = self._debug_kv_cache_prev_trans_info
+            next_trans_info: dict[str, tuple[int, int]] = {}
             for req_id, req_meta in list(requests.items())[:max_items]:
                 fields = []
                 for name in (
@@ -1110,7 +1126,18 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     if hasattr(req_meta, name):
                         fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
+                transed_tokens = getattr(req_meta, "local_transed_tokens", None)
+                computed_tokens = getattr(req_meta, "local_computed_tokens", None)
+                if isinstance(transed_tokens, int) and isinstance(computed_tokens, int):
+                    previous = previous_trans_info.get(req_id)
+                    if previous is not None:
+                        fields.append(
+                            f"trans_delta={transed_tokens - previous[0]}"
+                            f" computed_delta={computed_tokens - previous[1]}"
+                        )
+                    next_trans_info[req_id] = (transed_tokens, computed_tokens)
                 summary.append(f"req_id={req_id} " + " ".join(fields))
+            self._debug_kv_cache_prev_trans_info = next_trans_info
 
         send_task = getattr(metadata, "send_task", None)
         if send_task is not None:
@@ -1139,6 +1166,86 @@ class NPUModelRunner(GPUModelRunner):
                             fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
                     summary.append(f"send_req_id={req_id} " + " ".join(fields))
         return summary
+
+    def _summarize_debug_kv_connector_state(self) -> list[str]:
+        """采集worker侧KV Connector运行状态，追加到快照connector_summary：
+        D端收流进度、传输失败标记的无效block、收流线程报告的失败请求"""
+        lines: list[str] = []
+        if not has_kv_transfer_group():
+            return lines
+        # worker进程内connector按role拆分，收流/传输状态都挂在connector_worker上
+        connector_worker = getattr(get_kv_transfer_group().connector, "connector_worker", None)
+        if connector_worker is None:
+            return lines
+        max_items = self._get_debug_kv_cache_stats_max_tokens()
+        # D端：external_req_id -> internal_req_id 映射，PD分离同请求对应关系的实锤
+        request_map = getattr(connector_worker, "request_map", None)
+        if isinstance(request_map, dict) and request_map:
+            lines.append(f"request_map={self._format_debug_value(request_map, max_items)}")
+        # D端：等待收流完成的请求数，跨step持续不降说明收流停滞
+        recving_metadata = getattr(connector_worker, "_recving_metadata", None)
+        if isinstance(recving_metadata, dict):
+            lines.append(f"recv_pending={len(recving_metadata)}")
+        # D端：收流线程暂存的失败请求（get_finished会取走清空，通常只是短暂非空）
+        recv_thread = getattr(connector_worker, "kv_recv_layer_thread", None)
+        failed_requests = getattr(recv_thread, "failed_requests", None)
+        if isinstance(failed_requests, set) and failed_requests:
+            try:
+                failed_sample = list(failed_requests)
+            except RuntimeError:
+                # 收流线程可能正在并发修改失败集合，本轮跳过采样
+                failed_sample = []
+            lines.append(
+                f"recv_failed={len(failed_requests)} reqs={self._format_debug_value(failed_sample, max_items)}"
+            )
+        # D端：传输失败标记的无效block，scheduler会重试这些block的传输
+        invalid_block_ids = getattr(connector_worker, "_invalid_block_ids", None)
+        if isinstance(invalid_block_ids, set) and invalid_block_ids:
+            lines.append(
+                f"invalid_blocks={len(invalid_block_ids)}"
+                f" blocks={self._format_debug_value(list(invalid_block_ids), max_items)}"
+            )
+        return lines
+
+    def _check_debug_kv_cache_stomp(self, watched_stats_cpu: list[_KVCacheDebugWatchedStat]) -> None:
+        """跨step对比watched slot的均值/方差指纹，输出被异常改写的物理slot（KV踩踏证据）。
+        注意：D端KV收流落盘、slot释放后被重分配也会合法改写数值，
+        需结合block-conflict日志（多请求占用同一block+offset）与request_map共同定界"""
+        current_values: dict[tuple[str, int, int, int], tuple[int, float, float]] = {}
+        for layer_name, component, slots, blocks, offsets, means, vars in watched_stats_cpu:
+            for slot, block_id, block_offset, mean, var in zip(
+                slots.tolist(),
+                blocks.tolist(),
+                offsets.tolist(),
+                means.tolist(),
+                vars.tolist(),
+            ):
+                current_values[(layer_name, component, block_id, block_offset)] = (
+                    int(slot),
+                    float(mean),
+                    float(var),
+                )
+        previous_values = self._debug_kv_cache_prev_watched_values
+        for key, (slot, mean, var) in current_values.items():
+            previous = previous_values.get(key)
+            if previous is None:
+                continue
+            if abs(mean - previous[1]) > _DEBUG_KV_CACHE_STOMP_EPS or abs(var - previous[2]) > _DEBUG_KV_CACHE_STOMP_EPS:
+                layer_name, component, block_id, block_offset = key
+                logger.info(
+                    "KV cache debug stomp: layer=%s component=%d slot=%d block=%d offset=%d"
+                    " mean %g->%g var %g->%g",
+                    layer_name,
+                    component,
+                    slot,
+                    block_id,
+                    block_offset,
+                    previous[1],
+                    mean,
+                    previous[2],
+                    var,
+                )
+        self._debug_kv_cache_prev_watched_values = current_values
 
     def _make_debug_token_rows(
         self,
@@ -3195,6 +3302,7 @@ class NPUModelRunner(GPUModelRunner):
                     "kv_cache_stats_stream": kv_cache_stats_stream,
                     "kv_cache_copy_stream": kv_cache_copy_stream,
                     "kv_cache_pending_output_fn": self._add_pending_debug_kv_cache_output,
+                    "kv_cache_stomp_check_fn": self._check_debug_kv_cache_stomp,
                 }
                 if kv_cache_stats_fn
                 else {}
