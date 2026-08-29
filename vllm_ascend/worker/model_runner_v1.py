@@ -190,7 +190,6 @@ if TYPE_CHECKING:
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
-
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -265,6 +264,273 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    debug_kv_cache_token_rows: "list[_KVCacheDebugTokenRow]"
+
+
+# _KVCacheDebugStat：单层K/V整体统计信息
+# (层名, component(0=K,1=V), 有效slot数量tensor, K/V数值均值tensor, K/V数值方差tensor)
+_KVCacheDebugStat: TypeAlias = tuple[str, int, torch.Tensor, torch.Tensor, torch.Tensor]
+
+# _KVCacheDebugSlotSample：slot采样样本
+# (层名, tensor[sample_num, 4]：每一行 [row, slot, block_id, block_offset])
+_KVCacheDebugSlotSample: TypeAlias = tuple[str, torch.Tensor]
+
+# _KVCacheDebugTokenRow：单条token调试行
+# 元组含义：(batch内row索引, 请求req_id字符串, token在序列中的position位置)
+_KVCacheDebugTokenRow: TypeAlias = tuple[int, str, int]
+
+# _KVCacheDebugWatchedStat：被持续观测的slot逐槽统计
+# (层名, component, slots张量, block_ids张量, offsets张量, 每个slot均值张量, 每个slot方差张量)
+_KVCacheDebugWatchedStat: TypeAlias = tuple[
+    str,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
+# _KVCacheDebugSnapshot：一次推理step完整KV调试快照，NamedTuple打包全部调试数据
+class _KVCacheDebugSnapshot(NamedTuple):
+    stats: list[_KVCacheDebugStat]  # 各层K/V整体统计
+    slot_samples: list[_KVCacheDebugSlotSample]  # slot采样样本
+    watched_stats: list[_KVCacheDebugWatchedStat]  # 跨step观测slot的统计
+    token_rows: list[_KVCacheDebugTokenRow]  # token与req/position映射表
+    connector_summary: list[str]  # KV‑Connector跨卡迁移摘要日志
+
+
+# 踩踏检测阈值：watched slot跨step均值/方差变化超过该阈值即视为数值被改写
+_DEBUG_KV_CACHE_STOMP_EPS: float = 1e-6
+
+
+class AsyncNPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    def __init__(
+            self,
+            model_runner_output: ModelRunnerOutput,
+            sampled_token_ids: torch.Tensor,
+            logprobs_tensors: LogprobsTensors | None,
+            invalid_req_indices: list[int],
+            async_output_copy_stream: torch.cuda.Stream,
+            vocab_size: int,
+            routed_experts: RoutedExpertsTensors | None = None,
+            # KV Cache调试回调：执行后返回_KVCacheDebugSnapshot
+            kv_cache_stats_fn: Callable[[], _KVCacheDebugSnapshot] | None = None,
+            # NPU stream：用于在推理完成后采集KV统计快照
+            kv_cache_stats_stream: torch.npu.Stream | None = None,
+            # NPU stream：用于NPU tensor异步拷贝到CPU锁页内存
+            kv_cache_copy_stream: torch.npu.Stream | None = None,
+            # 拷贝未就绪时，把当前output加入pending队列的回调函数
+            kv_cache_pending_output_fn: Callable[[Any], None] | None = None,
+            # 跨step踩踏检测回调：输入CPU侧watched统计，对比输出被异常改写的slot
+            kv_cache_stomp_check_fn: Callable[[list[_KVCacheDebugWatchedStat]], None] | None = None,
+    ):
+        # 保存NPU侧原始统计数据（设备张量）
+        self._kv_cache_stats: list[_KVCacheDebugStat] = []
+        # 已经异步拷贝到CPU锁页内存的统计数据
+        self._kv_cache_stats_cpu: list[_KVCacheDebugStat] = []
+        # NPU侧slot采样样本
+        self._kv_cache_slot_samples: list[_KVCacheDebugSlotSample] = []
+        # 拷贝至CPU后的slot采样样本
+        self._kv_cache_slot_samples_cpu: list[_KVCacheDebugSlotSample] = []
+        # NPU侧watch slot统计
+        self._kv_cache_watched_stats: list[_KVCacheDebugWatchedStat] = []
+        # 拷贝至CPU后的watch slot统计
+        self._kv_cache_watched_stats_cpu: list[_KVCacheDebugWatchedStat] = []
+        # token‑req‑position映射
+        self._kv_cache_token_rows: list[_KVCacheDebugTokenRow] = []
+        # KV‑Connector摘要信息
+        self._kv_cache_connector_summary: list[str] = []
+        # pending output入队回调
+        self._kv_cache_pending_output_fn = kv_cache_pending_output_fn
+        # NPU event，标记拷贝到CPU完成
+        self._kv_cache_stats_ready_event: torch.npu.Event | None = None
+        # 标记本批调试日志是否已经打印，避免重复输出
+        self._kv_cache_stats_logged = False
+        super().__init__(
+            model_runner_output=model_runner_output,
+            sampled_token_ids=sampled_token_ids,
+            logprobs_tensors=logprobs_tensors,
+            invalid_req_indices=invalid_req_indices,
+            async_output_copy_stream=async_output_copy_stream,
+            vocab_size=vocab_size,
+            routed_experts=routed_experts,
+        )
+
+        # 如果调试开关没全部开启，直接返回，不做任何采集
+        if (
+                kv_cache_stats_fn is None
+                or kv_cache_stats_stream is None
+                or kv_cache_copy_stream is None
+        ):
+            return
+        # 获取当前正在执行推理的NPU主流
+        producer_stream = torch.npu.current_stream()
+
+        # 切到专门的统计stream执行snapshot采集
+        with torch.npu.stream(kv_cache_stats_stream):
+            # 等待推理主流全部完成，再执行KV Cache快照采集
+            kv_cache_stats_stream.wait_stream(producer_stream)
+            # 执行快照采集，全部张量还在NPU设备上
+            snapshot = kv_cache_stats_fn()
+
+        # 将快照结果保存到实例成员（NPU张量）
+        self._kv_cache_stats = snapshot.stats
+        self._kv_cache_slot_samples = snapshot.slot_samples
+        self._kv_cache_watched_stats = snapshot.watched_stats
+        self._kv_cache_token_rows = snapshot.token_rows
+        self._kv_cache_connector_summary = snapshot.connector_summary
+
+        # 如果快照为空，直接退出，不需要拷贝
+        if (
+                not self._kv_cache_stats
+                and not self._kv_cache_slot_samples
+                and not self._kv_cache_watched_stats
+                and not self._kv_cache_connector_summary
+        ):
+            return
+
+        # 创建NPU Event，标记拷贝到CPU完成
+        self._kv_cache_stats_ready_event = torch.npu.Event()
+
+        # 切到拷贝专用stream，执行NPU→CPU异步拷贝
+        with torch.npu.stream(kv_cache_copy_stream):
+            # 等待统计采集stream执行完毕再开始拷贝
+            kv_cache_copy_stream.wait_stream(kv_cache_stats_stream)
+
+            # 遍历整体统计，逐个张量异步拷贝CPU锁页内存
+            for layer_name, component, slots, mean, var in self._kv_cache_stats:
+                self._kv_cache_stats_cpu.append(
+                    (
+                        layer_name,
+                        component,
+                        self._async_copy_tensor_to_cpu(slots),
+                        self._async_copy_tensor_to_cpu(mean),
+                        self._async_copy_tensor_to_cpu(var),
+                    )
+                )
+
+            # 拷贝slot采样样本张量
+            for layer_name, sample in self._kv_cache_slot_samples:
+                self._kv_cache_slot_samples_cpu.append(
+                    (layer_name, self._async_copy_tensor_to_cpu(sample))
+                )
+
+            # 拷贝watched slot统计张量
+            for layer_name, component, slots, blocks, offsets, means, vars in self._kv_cache_watched_stats:
+                self._kv_cache_watched_stats_cpu.append(
+                    (
+                        layer_name,
+                        component,
+                        self._async_copy_tensor_to_cpu(slots),
+                        self._async_copy_tensor_to_cpu(blocks),
+                        self._async_copy_tensor_to_cpu(offsets),
+                        self._async_copy_tensor_to_cpu(means),
+                        self._async_copy_tensor_to_cpu(vars),
+                    )
+                )
+            # 在拷贝流上记录event，拷贝完成后event变为可查询状态
+            self._kv_cache_stats_ready_event.record()
+
+    @staticmethod
+    def _async_copy_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        """异步把NPU tensor拷贝到CPU锁页内存，non_blocking，不阻塞NPU流"""
+        # 分配CPU锁页内存，PIN_MEMORY为平台开关，NPU支持DMA直接访问
+        cpu_tensor = torch.empty_like(
+            tensor,
+            device="cpu",
+            pin_memory=PIN_MEMORY,  # 锁页内存，non_blocking拷贝
+        )
+        # non_blocking=True：异步拷贝，依赖NPU stream同步event，不能马上访问cpu_tensor
+        cpu_tensor.copy_(tensor, non_blocking=True)
+        return cpu_tensor
+
+    def try_log_kv_cache_stats(self) -> bool:
+        """尝试打印KV调试日志；返回True：已打印/无需打印；False：NPU→CPU拷贝还未完成"""
+        # 已经打印过，直接返回True
+        if self._kv_cache_stats_logged:
+            return True
+        # 没有event代表没有开启调试，标记已打印返回True
+        if self._kv_cache_stats_ready_event is None:
+            self._kv_cache_stats_logged = True
+            return True
+        # 查询NPU event，拷贝未完成直接返回False，上层加入pending队列
+        if not self._kv_cache_stats_ready_event.query():
+            return False
+
+        # -------- 走到这里：NPU→CPU拷贝全部完成，可以在CPU侧访问tensor.item() --------
+        # 打印每层K/V整体统计日志
+        for layer_name, component, slots, mean, var in self._kv_cache_stats_cpu:
+            num_slots = int(slots.item())
+            if num_slots == 0:
+                continue
+            logger.info(
+                "KV cache debug stats: layer=%s component=%d slots=%d mean=%g var=%g",
+                layer_name,
+                component,
+                num_slots,
+                float(mean.item()),
+                float(var.item()),
+            )
+
+        # 打印KV‑Connector跨卡迁移摘要
+        for summary in self._kv_cache_connector_summary:
+            logger.info("KV cache debug connector: %s", summary)
+
+        # 构建token行映射字典：key=batch_row，value=(req_id, position)
+        token_rows = {
+            row: (req_id, position)
+            for row, req_id, position in self._kv_cache_token_rows
+        }
+        # 打印slot采样样本日志：row/slot/block/offset以及对应req_id、token位置
+        for layer_name, sample in self._kv_cache_slot_samples_cpu:
+            for row, slot, block_id, block_offset in sample.tolist():
+                req_id, position = token_rows.get(row, ("<unknown>", -1))
+                logger.info(
+                    "KV cache debug slot: layer=%s row=%d req_id=%s pos=%d slot=%d block=%d offset=%d",
+                    layer_name,
+                    row,
+                    req_id,
+                    position,
+                    slot,
+                    block_id,
+                    block_offset,
+                )
+
+        # 打印watched slot逐槽统计，观察多轮同一个slot数值变化
+        for layer_name, component, slots, blocks, offsets, means, vars in self._kv_cache_watched_stats_cpu:
+            for slot, block_id, block_offset, mean, var in zip(
+                    slots.tolist(),
+                    blocks.tolist(),
+                    offsets.tolist(),
+                    means.tolist(),
+                    vars.tolist(),
+            ):
+                logger.info(
+                    "KV cache debug watched: layer=%s component=%d slot=%d block=%d offset=%d mean=%g var=%g",
+                    layer_name,
+                    component,
+                    slot,
+                    block_id,
+                    block_offset,
+                    mean,
+                    var,
+                )
+
+        # 标记日志已经输出，避免重复打印
+        self._kv_cache_stats_logged = True
+        return True
+
+    def get_output(self) -> ModelRunnerOutput:
+        output = super().get_output()
+        # 尝试输出日志；如果拷贝未就绪，调用回调把自身加入pending输出队列
+        if (
+                not self.try_log_kv_cache_stats()
+                and self._kv_cache_pending_output_fn is not None
+        ):
+            self._kv_cache_pending_output_fn(self)
+        return output
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -274,7 +540,7 @@ class NPUModelRunner(GPUModelRunner):
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None) if model_config else None
         self.use_compress = (
-            hf_config is not None and hasattr(hf_config, "compress_ratios")
+                hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
 
         with _torch_cuda_wrapper():
@@ -291,11 +557,11 @@ class NPUModelRunner(GPUModelRunner):
             dtype=torch.int32,
         )
         self.group_len = self._make_buffer(
-            vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
+        )
         self.group_key_idx = self._make_buffer(
-           vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
+        )
         self.group_key_cache_idx = self._make_buffer(
             vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
         )
@@ -319,6 +585,20 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        # 保存上一轮step的slot样本，用于下一轮做watched slot观测
+        self._debug_kv_cache_previous_slot_samples: dict[str, torch.Tensor] = {}
+        # 上一轮step每个请求的transed/computed tokens，用于connector摘要的跨step差值
+        self._debug_kv_cache_prev_trans_info: dict[str, tuple[int, int]] = {}
+        # 上一轮step watched slot数值指纹，用于跨step踩踏检测
+        self._debug_kv_cache_prev_watched_values: dict[
+            tuple[str, int, int, int], tuple[int, float, float]
+        ] = {}
+        # pending输出队列：存放NPU拷贝还未完成的AsyncNPUModelRunnerOutput对象
+        self._debug_kv_cache_pending_outputs: list[AsyncNPUModelRunnerOutput] = []
+        # KV Cache快照采集专用NPU stream，懒初始化
+        self._debug_kv_cache_stats_stream: torch.npu.Stream | None = None
+        # NPU→CPU拷贝专用NPU stream，懒初始化
+        self._debug_kv_cache_copy_stream: torch.npu.Stream | None = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -372,7 +652,7 @@ class NPUModelRunner(GPUModelRunner):
             use_mla=self.model_config.use_mla,
             use_sparse=self.use_sparse,
             use_mm_prefix=self.model_config is not None
-            and self.model_config.is_mm_prefix_lm,
+                          and self.model_config.is_mm_prefix_lm,
         )
 
         # reinit valid_sampled_token_count_cpu with torch.int64 dtype
@@ -539,8 +819,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
-            self.compilation_config.cudagraph_capture_sizes
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                self.compilation_config.cudagraph_capture_sizes
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             self.cudagraph_batch_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
         else:
@@ -548,6 +828,7 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+
     @property
     def use_dcp(self) -> bool:
         return self.dcp_size > 1
@@ -561,17 +842,17 @@ class NPUModelRunner(GPUModelRunner):
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
-            AscendNgramProposer
-            | AscendNgramProposerNPU
-            | AscendEagleProposer
-            | AscendStep3p5MTPProposer
-            | AscendDraftModelProposer
-            | AscendDflashProposer
-            | AscendDSparkProposer
-            | AscendSuffixDecodingProposer
-            | AscendMedusaProposer
-            | AscendExtractHiddenStatesProposer
-            | None
+                AscendNgramProposer
+                | AscendNgramProposerNPU
+                | AscendEagleProposer
+                | AscendStep3p5MTPProposer
+                | AscendDraftModelProposer
+                | AscendDflashProposer
+                | AscendDSparkProposer
+                | AscendSuffixDecodingProposer
+                | AscendMedusaProposer
+                | AscendExtractHiddenStatesProposer
+                | None
         ) = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
@@ -630,17 +911,17 @@ class NPUModelRunner(GPUModelRunner):
 
     def _use_aclgraph(self) -> bool:
         return (
-            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
-            and not self.model_config.enforce_eager
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+                and not self.model_config.enforce_eager
         )
 
     def _sync_metadata_across_dp(
-        self,
-        num_tokens: int,
-        is_draft_model: bool = False,
-        cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        allow_dp_padding: bool = False,
+            self,
+            num_tokens: int,
+            is_draft_model: bool = False,
+            cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+            allow_dp_padding: bool = False,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
@@ -681,18 +962,612 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
+    def _get_debug_kv_cache_stats_max_layers(self) -> int:
+        """读取配置：debug_kv_cache_stats_max_layers，最多统计多少层KV Cache"""
+        additional_config = self.vllm_config.additional_config or {}
+        if additional_config.get("debug_kv_cache_stats") is not True:
+            return 0
+        max_layers = additional_config.get("debug_kv_cache_stats_max_layers", 1)
+        if not isinstance(max_layers, int) or isinstance(max_layers, bool):
+            return 1
+        return max(max_layers, 0)
+
+    def _get_debug_kv_cache_stats_max_tokens(self) -> int:
+        """读取配置：debug_kv_cache_stats_max_tokens，最多采样多少个token做样本"""
+        additional_config = self.vllm_config.additional_config or {}
+        max_tokens = additional_config.get("debug_kv_cache_stats_max_tokens", 8)
+        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
+            return 8
+        return max(max_tokens, 0)
+
+    def _should_collect_kv_cache_stats(self) -> bool:
+        """判断是否本step需要采集KV Cache调试统计：开启异步调度 && max_layers>0"""
+        return (
+                self.use_async_scheduling
+                and self._get_debug_kv_cache_stats_max_layers() > 0
+        )
+
+    def _get_debug_kv_cache_streams(
+            self,
+    ) -> tuple[torch.npu.Stream, torch.npu.Stream]:
+        """懒创建/获取KV debug需要的两个独立NPU stream，返回(stats_stream, copy_stream)"""
+        if self._debug_kv_cache_stats_stream is None:
+            self._debug_kv_cache_stats_stream = torch.npu.Stream()
+        if self._debug_kv_cache_copy_stream is None:
+            self._debug_kv_cache_copy_stream = torch.npu.Stream()
+        return self._debug_kv_cache_stats_stream, self._debug_kv_cache_copy_stream
+
+    def _add_pending_debug_kv_cache_output(
+            self,
+            output: AsyncNPUModelRunnerOutput,
+    ) -> None:
+        """
+        当output的NPU拷贝还未完成时，加入pending队列；
+        限制队列只保留最近2个，防止队列无限膨胀
+        """
+        # 如果已经可以打印，直接返回，不加入pending
+        if output.try_log_kv_cache_stats():
+            return
+        self._debug_kv_cache_pending_outputs.append(output)
+        # 只保留末尾2个，限制pending队列长度，避免内存累积
+        self._debug_kv_cache_pending_outputs = self._debug_kv_cache_pending_outputs[-2:]
+
+    def _drain_ready_debug_kv_cache_outputs(self) -> None:
+        """
+        drain：处理pending队列里的output；轮询event，能打印就打印，不能打印继续留在pending
+        每个execute_model开头调用，消费上一轮遗留的pending outputs
+        """
+        pending_outputs = []
+        for output in self._debug_kv_cache_pending_outputs:
+            # try_log_kv_cache_stats返回False：拷贝未就绪，继续留在pending
+            if not output.try_log_kv_cache_stats():
+                pending_outputs.append(output)
+        # 更新pending列表，只保留还没就绪的output
+        self._debug_kv_cache_pending_outputs = pending_outputs
+
+    @staticmethod
+    def _format_debug_value(value: Any, max_items: int = 8) -> str:
+        """通用格式化工具函数：把tensor/np/list/dict转为可读调试字符串，限制输出元素个数"""
+        if value is None:
+            return "None"
+        if isinstance(value, torch.Tensor):
+            return f"Tensor(shape={tuple(value.shape)}, device={value.device}, dtype={value.dtype})"
+        if isinstance(value, np.ndarray):
+            return str(value[:max_items].tolist())
+        if isinstance(value, (list, tuple)):
+            items = [
+                NPUModelRunner._format_debug_value(item, max_items)
+                for item in value[:max_items]
+            ]
+            suffix = "" if len(value) <= max_items else f"...(+{len(value) - max_items})"
+            return f"{items}{suffix}"
+        if isinstance(value, dict):
+            keys = list(value)[:max_items]
+            suffix = "" if len(value) <= max_items else f"...(+{len(value) - max_items})"
+            return (
+                    "{"
+                    + ", ".join(
+                f"{key}: {NPUModelRunner._format_debug_value(value[key], max_items)}"
+                for key in keys
+            )
+                    + "}"
+                    + suffix
+            )
+        return str(value)
+
+    def _summarize_debug_kv_connector_metadata(self, scheduler_output: "SchedulerOutput") -> list[str]:
+        """提取scheduler_output.kv_connector_metadata，格式化输出文本摘要，用于快照connector_summary"""
+        metadata = getattr(scheduler_output, "kv_connector_metadata", None)
+        if metadata is None:
+            return ["metadata=None"]
+
+        max_items = self._get_debug_kv_cache_stats_max_tokens()
+        summary = [f"type={type(metadata).__name__}"]
+        if self.is_kv_producer and not self.is_kv_consumer:
+            summary.append("role=P(prefill)")
+        elif self.is_kv_consumer and not self.is_kv_producer:
+            summary.append("role=D(decode)")
+        elif self.is_kv_producer and self.is_kv_consumer:
+            summary.append("role=PD(mixed)")
+        requests = getattr(metadata, "requests", None)
+        if isinstance(requests, dict):
+            # 保存本轮transed/computed tokens，下一轮输出跨step差值：
+            # P端分块发送时transed_tokens应持续增长，跨step停滞即发送异常的定界证据
+            previous_trans_info = self._debug_kv_cache_prev_trans_info
+            next_trans_info: dict[str, tuple[int, int]] = {}
+            for req_id, req_meta in list(requests.items())[:max_items]:
+                fields = []
+                for name in (
+                        "local_block_ids",
+                        "remote_block_ids",
+                        "block_ids_by_group",
+                        "allocated_block_ids_by_group",
+                        "local_computed_tokens",
+                        "local_transed_tokens",
+                        "remote_cache_tokens",
+                        "chunk_finish",
+                ):
+                    if hasattr(req_meta, name):
+                        fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
+                transed_tokens = getattr(req_meta, "local_transed_tokens", None)
+                computed_tokens = getattr(req_meta, "local_computed_tokens", None)
+                if isinstance(transed_tokens, int) and isinstance(computed_tokens, int):
+                    previous = previous_trans_info.get(req_id)
+                    if previous is not None:
+                        fields.append(
+                            f"trans_delta={transed_tokens - previous[0]}"
+                            f" computed_delta={computed_tokens - previous[1]}"
+                        )
+                    next_trans_info[req_id] = (transed_tokens, computed_tokens)
+                summary.append(f"req_id={req_id} " + " ".join(fields))
+            self._debug_kv_cache_prev_trans_info = next_trans_info
+
+        send_task = getattr(metadata, "send_task", None)
+        if send_task is not None:
+            fields = []
+            for name in (
+                    "layer_name",
+                    "layer_idx",
+                    "group_rearrange_block_ids",
+                    "group_num_blocks",
+                    "group_num_tokens",
+            ):
+                if hasattr(send_task, name):
+                    fields.append(f"{name}={self._format_debug_value(getattr(send_task, name))}")
+            summary.append("send_task " + " ".join(fields))
+            send_request = getattr(send_task, "send_request", None)
+            if isinstance(send_request, dict):
+                for req_id, req_meta in list(send_request.items())[:max_items]:
+                    fields = []
+                    for name in (
+                            "local_block_ids",
+                            "remote_block_ids",
+                            "local_computed_tokens",
+                            "local_transed_tokens",
+                    ):
+                        if hasattr(req_meta, name):
+                            fields.append(f"{name}={self._format_debug_value(getattr(req_meta, name))}")
+                    summary.append(f"send_req_id={req_id} " + " ".join(fields))
+        return summary
+
+    def _summarize_debug_kv_connector_state(self) -> list[str]:
+        """采集worker侧KV Connector运行状态，追加到快照connector_summary：
+        D端收流进度、传输失败标记的无效block、收流线程报告的失败请求"""
+        lines: list[str] = []
+        if not has_kv_transfer_group():
+            return lines
+        # worker进程内connector按role拆分，收流/传输状态都挂在connector_worker上
+        connector_worker = getattr(get_kv_transfer_group().connector, "connector_worker", None)
+        if connector_worker is None:
+            return lines
+        max_items = self._get_debug_kv_cache_stats_max_tokens()
+        # D端：external_req_id -> internal_req_id 映射，PD分离同请求对应关系的实锤
+        request_map = getattr(connector_worker, "request_map", None)
+        if isinstance(request_map, dict) and request_map:
+            lines.append(f"request_map={self._format_debug_value(request_map, max_items)}")
+        # D端：等待收流完成的请求数，跨step持续不降说明收流停滞
+        recving_metadata = getattr(connector_worker, "_recving_metadata", None)
+        if isinstance(recving_metadata, dict):
+            lines.append(f"recv_pending={len(recving_metadata)}")
+        # D端：收流线程暂存的失败请求（get_finished会取走清空，通常只是短暂非空）
+        recv_thread = getattr(connector_worker, "kv_recv_layer_thread", None)
+        failed_requests = getattr(recv_thread, "failed_requests", None)
+        if isinstance(failed_requests, set) and failed_requests:
+            try:
+                failed_sample = list(failed_requests)
+            except RuntimeError:
+                # 收流线程可能正在并发修改失败集合，本轮跳过采样
+                failed_sample = []
+            lines.append(
+                f"recv_failed={len(failed_requests)} reqs={self._format_debug_value(failed_sample, max_items)}"
+            )
+        # D端：传输失败标记的无效block，scheduler会重试这些block的传输
+        invalid_block_ids = getattr(connector_worker, "_invalid_block_ids", None)
+        if isinstance(invalid_block_ids, set) and invalid_block_ids:
+            lines.append(
+                f"invalid_blocks={len(invalid_block_ids)}"
+                f" blocks={self._format_debug_value(list(invalid_block_ids), max_items)}"
+            )
+        return lines
+
+    def _check_debug_kv_cache_stomp(self, watched_stats_cpu: list[_KVCacheDebugWatchedStat]) -> None:
+        """跨step对比watched slot的均值/方差指纹，输出被异常改写的物理slot（KV踩踏证据）。
+        注意：D端KV收流落盘、slot释放后被重分配也会合法改写数值，
+        需结合block-conflict日志（多请求占用同一block+offset）与request_map共同定界"""
+        current_values: dict[tuple[str, int, int, int], tuple[int, float, float]] = {}
+        for layer_name, component, slots, blocks, offsets, means, vars in watched_stats_cpu:
+            for slot, block_id, block_offset, mean, var in zip(
+                    slots.tolist(),
+                    blocks.tolist(),
+                    offsets.tolist(),
+                    means.tolist(),
+                    vars.tolist(),
+            ):
+                current_values[(layer_name, component, block_id, block_offset)] = (
+                    int(slot),
+                    float(mean),
+                    float(var),
+                )
+        previous_values = self._debug_kv_cache_prev_watched_values
+        for key, (slot, mean, var) in current_values.items():
+            previous = previous_values.get(key)
+            if previous is None:
+                continue
+            if abs(mean - previous[1]) > _DEBUG_KV_CACHE_STOMP_EPS or abs(
+                    var - previous[2]) > _DEBUG_KV_CACHE_STOMP_EPS:
+                layer_name, component, block_id, block_offset = key
+                logger.info(
+                    "KV cache debug stomp: layer=%s component=%d slot=%d block=%d offset=%d"
+                    " mean %g->%g var %g->%g",
+                    layer_name,
+                    component,
+                    slot,
+                    block_id,
+                    block_offset,
+                    previous[1],
+                    mean,
+                    previous[2],
+                    var,
+                )
+        self._debug_kv_cache_prev_watched_values = current_values
+
+    def _make_debug_token_rows(
+            self,
+            num_scheduled_tokens: np.ndarray,
+            total_num_scheduled_tokens: int,
+    ) -> list[_KVCacheDebugTokenRow]:
+        """生成token_rows：sample一部分token，得到(batch_row, req_id, token_pos)映射列表，host侧list"""
+        max_tokens = self._get_debug_kv_cache_stats_max_tokens()
+        # 配置采样数为0或没有调度token，直接返回空列表        
+        if max_tokens == 0 or total_num_scheduled_tokens == 0:
+            return []
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        # 将每个req按照调度token数目重复，得到每个token对应的req索引
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens[:num_reqs])
+        # 实际采样数量取三者最小值，防止越界
+        sample_count = min(max_tokens, total_num_scheduled_tokens, len(req_indices))
+        # 读取预分配的position buffer
+        positions = self._positions_np_buf[:sample_count]
+        # 组装每一行元组返回
+        return [(row, req_ids[int(req_indices[row])], int(positions[row])) for row in range(sample_count)]
+
+    @staticmethod
+    def _get_debug_slot_mapping(attn_metadata: Any) -> torch.Tensor | None:
+        """从attn_metadata / decode / prefill子元数据提取slot_mapping；
+        如果是(block_id,offset)二维格式，转换成flat全局slot编号，返回一维slot_mapping tensor；没有返回None
+        """
+        slots: list[torch.Tensor] = []
+        for metadata in (
+                attn_metadata, getattr(attn_metadata, "decode", None), getattr(attn_metadata, "prefill", None),
+        ):
+            if metadata is None:
+                continue
+            slot_mapping = getattr(metadata, "slot_mapping", None)
+            if not isinstance(slot_mapping, torch.Tensor):
+                continue
+            # 一维 flat slot index：Ascend 等平台直接使用全局slot编号
+            if slot_mapping.ndim == 1:
+                slots.append(slot_mapping.reshape(-1))
+                continue
+            # slot_mapping形状最后一维=2，代表[block_id, block_offset]编码格式
+            if slot_mapping.ndim > 1 and slot_mapping.shape[-1] == 2:
+                block_size = getattr(metadata, "block_size", None)
+                if not isinstance(block_size, int) or block_size <= 0:
+                    continue
+                slot_mapping = slot_mapping.to(torch.long)
+                # block_id * block_size + offset，展开为全局flat slot index
+                slot_mapping = slot_mapping[..., 0] * block_size + slot_mapping[..., 1]
+                slots.append(slot_mapping.reshape(-1))
+        if not slots:
+            return None
+        return torch.cat(slots) if len(slots) > 1 else slots[0]
+
+    def _get_debug_layer_slots(
+            self,
+            attn_metadata: PerLayerAttnMetadata,
+            layer_name: str,
+    ) -> torch.Tensor | None:
+        """按layer_name从PerLayerAttnMetadata取出该层的flat slot_mapping，返回一维tensor；无返回None"""
+        metadata_dicts = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        slots = []
+        for metadata_dict in metadata_dicts:
+            metadata = metadata_dict.get(layer_name)
+            if metadata is None:
+                continue
+            slot_mapping = self._get_debug_slot_mapping(metadata)
+            if slot_mapping is not None:
+                slots.append(slot_mapping)
+        if not slots:
+            return None
+        return torch.cat(slots) if len(slots) > 1 else slots[0]
+
+    @staticmethod
+    def _get_debug_kv_cache_components(kv_cache: Any) -> tuple[torch.Tensor | None, ...]:
+        """解析kv_cache对象，提取K、V张量；兼容多层嵌套list/tuple包装格式"""
+        if isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 1 and isinstance(kv_cache[0], (list, tuple)):
+            kv_cache = kv_cache[0]
+        if isinstance(kv_cache, torch.Tensor):
+            return (kv_cache,)
+        if isinstance(kv_cache, (list, tuple)):
+            return tuple[Any, ...](kv_cache[:2])
+        return ()
+
+    @staticmethod
+    def _collect_debug_tensor_stats(
+            layer_name: str,
+            component: int,
+            cache: torch.Tensor,
+            slot_mapping: torch.Tensor,
+    ) -> _KVCacheDebugStat | None:
+        """
+        NPU侧计算本层K/V cache在slot_mapping指向的有效slot上的统计：有效slot数、均值、方差
+        全部运算NPU完成，返回_KVCacheDebugStat元组；异常返回None
+        """
+        # cache维度不足2或者空tensor，直接返回None
+        if cache.ndim < 2 or cache.numel() == 0:
+            return None
+        block_size = cache.shape[1]
+        if block_size <= 0:
+            return None
+        # slot_mapping必须在设备侧，CPU直接丢弃
+        if slot_mapping.device.type == "cpu":
+            return None
+        # 将slot_mapping迁移到cache所在设备，转为long一维
+        slot_mapping = slot_mapping.to(cache.device, non_blocking=True).to(torch.long).reshape(-1)
+        if slot_mapping.numel() == 0:
+            return None
+        # 计算全局最大slot编号
+        max_slot = cache.shape[0] * block_size
+        # slot排序，用于去重，同一个slot只统计一次
+        sorted_slots = torch.sort(slot_mapping).values
+        # slot合法性校验 >=0 且 <max_slot
+        valid = (sorted_slots >= 0) & (sorted_slots < max_slot)
+        # first_occurrence标记：标记排序后第一次出现的slot，实现slot去重
+        first_occurrence = torch.ones_like(valid)
+        first_occurrence[1:] = sorted_slots[1:] != sorted_slots[:-1]
+        valid = valid & first_occurrence
+        # clamp防止越界索引cache
+        safe_slots = sorted_slots.clamp(0, max_slot - 1)
+        # 由全局slot编号反解block_id与block_offset
+        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+        block_offsets = safe_slots % block_size
+        # 取出cache对应位置的值，转float用于统计
+        values = cache[block_ids, block_offsets].float().reshape(slot_mapping.numel(), -1)
+        # valid转为dtype与values一致的mask
+        mask = valid.to(values.dtype).unsqueeze(-1)
+        masked_values = values * mask
+        # 有效slot总个数
+        slots = valid.sum(dtype=torch.int64)
+        # 分母：有效元素总数量，clamp_min防止除0
+        denominator = slots.to(torch.float32) * values.shape[1]
+        denominator = denominator.clamp_min(1.0)
+        # 加权求均值
+        mean = masked_values.sum() / denominator
+        # 方差公式：E[x²] - (E[x])²，clamp_min保证方差>=0
+        var = (masked_values.square().sum() / denominator - mean.square()).clamp_min(0.0)
+        return (layer_name, component, slots, mean, var)
+
+    @staticmethod
+    def _collect_debug_watched_tensor_stats(
+            layer_name: str,
+            component: int,
+            cache: torch.Tensor,
+            watched_slots: torch.Tensor | None,
+    ) -> _KVCacheDebugWatchedStat | None:
+        """
+        NPU侧：对指定一批watched_slots，逐slot计算每个slot内部feature维度的mean/var；
+        返回包含slot/block_id/offset/means/vars的元组；异常返回None
+        """
+        if (cache.ndim < 2
+                or cache.numel() == 0
+                or watched_slots is None
+                or watched_slots.numel() == 0
+        ):
+            return None
+        block_size = cache.shape[1]
+        if block_size <= 0:
+            return None
+        max_slot = cache.shape[0] * block_size
+        # watched_slots迁移到cache设备，转为long一维
+        slots = watched_slots.to(cache.device, non_blocking=True).to(torch.long).reshape(-1)
+        # slot合法性判断
+        valid = (slots >= 0) & (slots < max_slot)
+        safe_slots = slots.clamp(0, max_slot - 1)
+        # slot反解block_id、offset
+        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+        block_offsets = safe_slots % block_size
+        # 取出cache对应位置
+        values = cache[block_ids, block_offsets].float().reshape(slots.numel(), -1)
+        if values.shape[1] == 0:
+            return None
+        # 在每个slot的feature维度上求均值、方差
+        means = values.mean(dim=1)
+        vars = (values.square().mean(dim=1) - means.square()).clamp_min(0.0)
+        zeros = torch.zeros_like(means)
+        # 非法slot位置置0
+        means = torch.where(valid, means, zeros)
+        vars = torch.where(valid, vars, zeros)
+        # 非法slot的block_id、offset填‑1
+        invalid_slots = torch.full_like(slots, -1)
+        block_ids = torch.where(valid, block_ids, invalid_slots)
+        block_offsets = torch.where(valid, block_offsets, invalid_slots)
+        return (layer_name, component, slots, block_ids, block_offsets, means, vars)
+
+    @staticmethod
+    def _make_debug_slot_sample(
+            layer_name: str, slot_mapping: torch.Tensor, block_size: int, max_slot: int, sample_count: int,
+    ) -> _KVCacheDebugSlotSample | None:
+        """
+        从slot_mapping取前sample_count个slot，组装[row, slot, block_id, block_offset]二维tensor样本；
+        用于日志打印；返回None代表失败
+        """
+        if sample_count == 0 or max_slot <= 0 or slot_mapping.device.type == "cpu":
+            return None
+        slot_mapping = slot_mapping.to(torch.long).reshape(-1)
+        sample_count = min(sample_count, slot_mapping.numel())
+        if sample_count == 0:
+            return None
+        # 取前sample_count个slot
+        slots = slot_mapping[:sample_count]
+        valid_slots = (slots >= 0) & (slots < max_slot)
+        safe_slots = slots.clamp(0, max_slot - 1)
+        # row为样本内部序号0~sample_count‑1
+        rows = torch.arange(sample_count, device=slots.device, dtype=torch.long)
+        invalid_value = torch.full_like(safe_slots, -1)
+        # 反解block_id，非法slot填‑1
+        blocks = torch.where(
+            valid_slots, torch.div(safe_slots, block_size, rounding_mode="floor"),
+            invalid_value,
+        )
+        # 反解block offset，非法slot填‑1
+        offsets = torch.where(valid_slots, safe_slots % block_size, invalid_value)
+        # 按dim=1堆叠：[row, slot, block, offset]
+        return layer_name, torch.stack((rows, slots, blocks, offsets), dim=1)
+
+    def _make_debug_kv_cache_snapshot(
+            self, attn_metadata: PerLayerAttnMetadata, scheduler_output: "SchedulerOutput",
+            token_rows: list[_KVCacheDebugTokenRow],
+    ) -> _KVCacheDebugSnapshot:
+        """
+        主快照生成函数：遍历层，采集统计、slot样本、watched slot统计、connector摘要；
+        全部计算在NPU设备；返回_KVCacheDebugSnapshot，tensor驻留NPU
+        """
+        # 判断是否开启采集；未开启直接返回空快照
+        if not self._should_collect_kv_cache_stats():
+            return _KVCacheDebugSnapshot([], [], [], [], [])
+        max_layers = self._get_debug_kv_cache_stats_max_layers()
+        stats: list[_KVCacheDebugStat] = []
+        slot_samples: list[_KVCacheDebugSlotSample] = []
+        watched_stats: list[_KVCacheDebugWatchedStat] = []
+        # 上一轮保存的slot样本，用来生成本轮watched_slots
+        previous_slot_samples = self._debug_kv_cache_previous_slot_samples
+        # 保存本轮新的slot样本，给下一轮作为watched输入
+        next_previous_slot_samples: dict[str, torch.Tensor] = {}
+        # cache ptr集合，去重：同一个物理KV cache只统计一次
+        seen_cache_ptrs: set[tuple[int, ...]] = set()
+        unique_layers = 0
+
+        # 诊断：attn_metadata 的实际 key 和 slot_mapping 情况
+        meta_dicts = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        for midx, md in enumerate(meta_dicts):
+            if not md:
+                logger.info("KV cache debug: attn_metadata[%d] is empty", midx)
+                continue
+            for k, v in md.items():
+                sm = getattr(v, "slot_mapping", None)
+                sm_info = "None" if sm is None else f"shape={sm.shape}, dtype={sm.dtype}"
+                logger.info(
+                    "KV cache debug: attn_metadata[%d] key=%s type=%s slot_mapping=%s",
+                    midx, k, type(v).__name__, sm_info,
+                )
+
+        # 遍历static_forward_context里面的模块
+        ctx_keys = list(self.compilation_config.static_forward_context.keys())
+        logger.info("KV cache debug: static_forward_context keys=%s", ctx_keys)
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            # Mamba层跳过，只处理Attention KV Cache
+            if isinstance(module, MambaBase):
+                continue
+            # 诊断：module类型、是否有kv_cache
+            kv_cache_attr = getattr(module, "kv_cache", None)
+            has_kv = kv_cache_attr is not None
+            kv_type = type(kv_cache_attr).__name__ if has_kv else "None"
+            # 提取K/V cache张量
+            components = self._get_debug_kv_cache_components(kv_cache_attr)
+            tensor_components = [component for component in components if isinstance(component, torch.Tensor)]
+            logger.info(
+                "KV cache debug: layer=%s module_type=%s has_kv_cache=%s kv_type=%s n_tensors=%d",
+                layer_name, type(module).__name__, has_kv, kv_type, len(tensor_components),
+            )
+            if not tensor_components:
+                logger.info("KV cache debug:   -> skip, no tensor components")
+                continue
+            # 用data_ptr判断是否是同一个物理KV cache，做去重
+            cache_ptrs = tuple(component.data_ptr() for component in tensor_components)
+            if cache_ptrs in seen_cache_ptrs:
+                logger.info("KV cache debug:   -> skip, duplicate cache ptrs")
+                continue
+            # 获取本层slot_mapping
+            slot_mapping = self._get_debug_layer_slots(attn_metadata, layer_name)
+            logger.info("KV cache debug:   slot_mapping=%s",
+                        "None" if slot_mapping is None else f"shape={slot_mapping.shape}, dtype={slot_mapping.dtype}")
+            # 从上一轮样本取出watched_slots（取样本里的slot列）
+            watched_sample = previous_slot_samples.get(layer_name)
+            watched_slots = (
+                watched_sample[:, 1]
+                if watched_sample is not None and watched_sample.ndim == 2 and watched_sample.shape[1] >= 2
+                else None
+            )
+            has_watched_slots = (
+                    watched_slots is not None and watched_slots.numel() > 0
+            )
+            logger.info("KV cache debug:   has_watched_slots=%s", has_watched_slots)
+            # 既没有slot_mapping也没有watched_slots，跳过本层
+            if slot_mapping is None and not has_watched_slots:
+                logger.info("KV cache debug:   -> skip, no slot_mapping and no watched_slots")
+                continue
+
+            layer_stats: list[_KVCacheDebugStat] = []
+            sample_cache = next((component for component in components if isinstance(component, torch.Tensor)), None)
+            # 生成slot采样样本，保存到next_previous_slot_samples供下一轮使用
+            if slot_mapping is not None and sample_cache is not None and sample_cache.ndim >= 2:
+                sample = self._make_debug_slot_sample(
+                    layer_name, slot_mapping, sample_cache.shape[1],
+                    sample_cache.shape[0] * sample_cache.shape[1],
+                    len(token_rows),
+                )
+                if sample is not None:
+                    slot_samples.append(sample)
+                    next_previous_slot_samples[layer_name] = sample[1]
+
+            # 遍历K、V两个component，分别做统计
+            for component, cache in enumerate(components):
+                if not isinstance(cache, torch.Tensor):
+                    continue
+                # 有slot_mapping，计算本component整体统计
+                if slot_mapping is not None:
+                    stat = self._collect_debug_tensor_stats(layer_name, component, cache, slot_mapping)
+                    if stat is not None:
+                        layer_stats.append(stat)
+                # 如果存在watched_slots，做定点slot统计
+                watched_stat = self._collect_debug_watched_tensor_stats(
+                    layer_name, component, cache, watched_slots,
+                )
+                if watched_stat is not None:
+                    watched_stats.append(watched_stat)
+
+            # 当前层没有任何统计结果，跳过
+            if not layer_stats and not has_watched_slots:
+                continue
+            # 标记该cache已经处理过，避免重复统计
+            seen_cache_ptrs.add(cache_ptrs)
+            stats.extend(layer_stats)
+            unique_layers += 1
+            # 达到max_layers配置上限，停止遍历后续层
+            if unique_layers >= max_layers:
+                break
+
+        # 更新实例成员，保存本轮slot样本，下一轮作为watched输入
+        self._debug_kv_cache_previous_slot_samples = next_previous_slot_samples
+        # 组装完整快照对象返回；connector_summary调用元数据格式化函数
+        return _KVCacheDebugSnapshot(
+            stats, slot_samples, watched_stats, token_rows,
+            self._summarize_debug_kv_connector_metadata(scheduler_output),
+        )
+
     def _is_pd_prefill_worker(self) -> bool:
         return self.is_kv_producer and not self.is_kv_consumer
 
     def _apply_pp_sampled_tokens_from_scheduler_output(
-        self,
-        scheduler_output: "SchedulerOutput",
+            self,
+            scheduler_output: "SchedulerOutput",
     ) -> None:
         pp = get_pp_group()
         if (
-            not self.use_async_scheduling
-            or pp.is_last_rank
-            or self._is_pd_prefill_worker()
+                not self.use_async_scheduling
+                or pp.is_last_rank
+                or self._is_pd_prefill_worker()
         ):
             return
 
@@ -768,13 +1643,13 @@ class NPUModelRunner(GPUModelRunner):
         return super()._update_states(scheduler_output)
 
     def _pad_query_start_loc_for_fia(
-        self,
-        query_start_loc: torch.Tensor,
-        num_tokens_padded: int,
-        num_reqs_padded: int,
-        num_reqs: int,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        batch_desc_num_reqs: int | None = None,
+            self,
+            query_start_loc: torch.Tensor,
+            num_tokens_padded: int,
+            num_reqs_padded: int,
+            num_reqs: int,
+            cudagraph_runtime_mode: CUDAGraphMode | None = None,
+            batch_desc_num_reqs: int | None = None,
     ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
@@ -783,7 +1658,7 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
-            self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
+                self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
@@ -792,15 +1667,15 @@ class NPUModelRunner(GPUModelRunner):
         # e.g. 1 request with 1 token when num_spec > 1 (num_spec = 3 and cudagraph_batch_size = 4 for example)
         # will cause tokens are padded but requests are not
         if (
-            num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
+                num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
         ):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
             last_loc = query_start_loc.np[num_reqs]
-            query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
-                self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
+            query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = (
+                    self.arange_np[1: num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
             )
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
@@ -817,9 +1692,9 @@ class NPUModelRunner(GPUModelRunner):
         return num_reqs_padded
 
     def _prepare_inputs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_scheduled_tokens: np.ndarray,
+            self,
+            scheduler_output: "SchedulerOutput",
+            num_scheduled_tokens: np.ndarray,
     ) -> tuple[
         torch.Tensor,
         SpecDecodeMetadata | None,
@@ -885,9 +1760,9 @@ class NPUModelRunner(GPUModelRunner):
         self._compute_prev_positions(num_reqs)
         prev_positions_gpu = None
         if (
-            self.use_async_scheduling
-            and self.input_batch.prev_sampled_token_ids is not None
-            and prev_req_id_to_index
+                self.use_async_scheduling
+                and self.input_batch.prev_sampled_token_ids is not None
+                and prev_req_id_to_index
         ):
             self.prev_positions.copy_to_gpu(num_reqs)
             prev_positions_gpu = self.prev_positions.gpu[:num_reqs]
@@ -964,14 +1839,14 @@ class NPUModelRunner(GPUModelRunner):
                 actual_num_sched = actual_end - start_pos
 
                 if actual_num_sched > 0:
-                    self.inputs_embeds.cpu[output_idx : output_idx + actual_num_sched].copy_(
+                    self.inputs_embeds.cpu[output_idx: output_idx + actual_num_sched].copy_(
                         req_embeds[start_pos:actual_end]
                     )
 
                 output_idx += num_sched
 
         self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc.np[1: num_reqs + 1] = cu_num_tokens
         self.query_start_loc.copy_to_gpu()
 
         # Now, query_start_loc is padded.
@@ -980,10 +1855,9 @@ class NPUModelRunner(GPUModelRunner):
         # TODO delete it if fia's check is removed.
         if self._has_gdn:
             self.gdn_query_start_loc.np[0] = 0
-            self.gdn_query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-            self.gdn_query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+            self.gdn_query_start_loc.np[1: num_reqs + 1] = cu_num_tokens
+            self.gdn_query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
             self.gdn_query_start_loc.copy_to_gpu()
-
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -997,7 +1871,7 @@ class NPUModelRunner(GPUModelRunner):
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
 
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
-        self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+        self.query_start_loc.gpu[num_reqs + 1:].fill_(-1)
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
@@ -1030,7 +1904,7 @@ class NPUModelRunner(GPUModelRunner):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
-        
+
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
@@ -1072,9 +1946,9 @@ class NPUModelRunner(GPUModelRunner):
                 device=self.device, non_blocking=True
             )
         if (
-            self.use_async_spec_decode
-            and valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
+                self.use_async_spec_decode
+                and valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
         ):
             if prev_positions_gpu is None:
                 self.prev_positions.copy_to_gpu(num_reqs)
@@ -1156,12 +2030,12 @@ class NPUModelRunner(GPUModelRunner):
             )
         else:
             self.positions[:total_num_scheduled_tokens] = (
-                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-                + self.query_pos.gpu[:total_num_scheduled_tokens]
+                    self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                    + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
 
         self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
 
@@ -1172,9 +2046,9 @@ class NPUModelRunner(GPUModelRunner):
         # NPU->CPU seq_lens copy and the synchronize() in attention metadata.
         # Mirrors update_num_computed_tokens_for_batch_change on the GPU side.
         async_spec_decode_active = (
-            self.use_async_spec_decode
-            and valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
+                self.use_async_spec_decode
+                and valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
         )
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
@@ -1202,7 +2076,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata = None
             num_draft_tokens = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-            logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc.gpu[1: num_reqs + 1] - 1
         else:
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
@@ -1213,15 +2087,15 @@ class NPUModelRunner(GPUModelRunner):
             new_schedule_reqs = [x.req_id for x in scheduler_output.scheduled_new_reqs]
             num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
             for (
-                req_id,
-                draft_token_ids,
+                    req_id,
+                    draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 draft_len = len(draft_token_ids)
                 num_draft_tokens[req_idx] = draft_len
                 if (self.is_kv_consumer and req_id in new_schedule_reqs) or \
-                   (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
-                    self.input_batch.num_prompt_tokens[req_idx]):
+                        (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
+                         self.input_batch.num_prompt_tokens[req_idx]):
                     num_decode_draft_tokens[req_idx] = draft_len
                 else:
                     num_decode_draft_tokens[req_idx] = -1
@@ -1283,16 +2157,16 @@ class NPUModelRunner(GPUModelRunner):
         return attn_state
 
     def _sanitize_placeholder_input_ids_for_forward(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_forward_tokens: int,
+            self,
+            scheduler_output: "SchedulerOutput",
+            num_forward_tokens: int,
     ) -> None:
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not scheduled_spec_tokens:
             return
         if not any(
-            PLACEHOLDER_TOKEN_ID in token_ids
-            for token_ids in scheduled_spec_tokens.values()
+                PLACEHOLDER_TOKEN_ID in token_ids
+                for token_ids in scheduled_spec_tokens.values()
         ):
             return
 
@@ -1300,9 +2174,9 @@ class NPUModelRunner(GPUModelRunner):
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
     def _calc_spec_decode_metadata(
-        self,
-        num_draft_tokens: np.ndarray,
-        cu_num_scheduled_tokens: np.ndarray,
+            self,
+            num_draft_tokens: np.ndarray,
+            cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
@@ -1394,7 +2268,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _copy_valid_sampled_token_count(
-        self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
+            self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
         if self.valid_sampled_token_count_event is None:
             return
@@ -1402,7 +2276,7 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream): 
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
@@ -1412,22 +2286,22 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
-            self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
+            self.valid_sampled_token_count_gpu = valid_sampled_tokens_count  # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def propose_draft_token_ids(
-        self,
-        valid_sampled_token_ids: torch.Tensor | list[list[int]],
-        sampling_metadata: SamplingMetadata,
-        scheduler_output: "SchedulerOutput",
-        spec_decode_metadata: SpecDecodeMetadata,
-        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
-        positions: torch.Tensor,
-        num_scheduled_tokens: int,
-        hidden_states: torch.Tensor,
-        aux_hidden_states: torch.Tensor = None,
-        sample_hidden_states: torch.Tensor = None,
-        target_model_batch_desc: BatchDescriptor = None,
+            self,
+            valid_sampled_token_ids: torch.Tensor | list[list[int]],
+            sampling_metadata: SamplingMetadata,
+            scheduler_output: "SchedulerOutput",
+            spec_decode_metadata: SpecDecodeMetadata,
+            spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
+            positions: torch.Tensor,
+            num_scheduled_tokens: int,
+            hidden_states: torch.Tensor,
+            aux_hidden_states: torch.Tensor = None,
+            sample_hidden_states: torch.Tensor = None,
+            target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
         self._log_propose_draft_token_ids_entry(spec_decode_metadata, num_scheduled_tokens)
 
@@ -1453,10 +2327,10 @@ class NPUModelRunner(GPUModelRunner):
             (next_token_ids, draft_token_ids,
              num_valid_draft_tokens, valid_sampled_tokens_count
              ) = triton_ngram_spec_decode(
-                self.token_ids_gpu_tensor[:batch_size],       # [B, max_seq_len], in-place
-                self.num_tokens_no_spec_gpu[:batch_size],      # [B]
-                valid_sampled_token_ids,                       # list[list[int]] or [B, max_new_tokens]
-                self.discard_request_mask.gpu[:batch_size],    # [B]
+                self.token_ids_gpu_tensor[:batch_size],  # [B, max_seq_len], in-place
+                self.num_tokens_no_spec_gpu[:batch_size],  # [B]
+                valid_sampled_token_ids,  # list[list[int]] or [B, max_new_tokens]
+                self.discard_request_mask.gpu[:batch_size],  # [B]
                 vocab_size=vocab_size,
                 min_n=self.drafter.min_n,
                 max_n=self.drafter.max_n,
@@ -1615,7 +2489,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
             if get_pp_group().world_size > 1 and hasattr(
-                self.drafter, "take_last_draft_probs"
+                    self.drafter, "take_last_draft_probs"
             ):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
@@ -1627,9 +2501,9 @@ class NPUModelRunner(GPUModelRunner):
         return draft_token_ids
 
     def _log_propose_draft_token_ids_entry(
-        self,
-        spec_decode_metadata: SpecDecodeMetadata,
-        num_scheduled_tokens: int,
+            self,
+            spec_decode_metadata: SpecDecodeMetadata,
+            num_scheduled_tokens: int,
     ) -> None:
         """DFX entry probe for propose_draft_token_ids.
 
@@ -1664,14 +2538,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _copy_draft_token_ids_to_cpu(
-        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+            self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
         if not self.num_spec_tokens:
             return
         if self.use_async_scheduling and not (
-            scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
-            or get_pp_group().world_size > 1
+                scheduler_output.has_structured_output_requests
+                or self.input_batch.sampling_metadata.output_token_ids
+                or get_pp_group().world_size > 1
         ):
             return
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
@@ -1696,9 +2570,9 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
+            self,
+            scheduler_output: "SchedulerOutput",
+            intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
@@ -1716,13 +2590,13 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
         if (
-            self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+                self.speculative_config is not None
+                and self.speculative_config.use_ngram_gpu()
         ):
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
@@ -1742,9 +2616,9 @@ class NPUModelRunner(GPUModelRunner):
         # TODO(Ronald1995): deepcopy is expensive when there is a large
         # number of requests, optimize it later.
         if (
-            self.use_async_scheduling
-            and self.num_spec_tokens
-            and self._draft_token_ids is None  # type: ignore[has-type]
+                self.use_async_scheduling
+                and self.num_spec_tokens
+                and self._draft_token_ids is None  # type: ignore[has-type]
         ):
             scheduler_output = deepcopy(scheduler_output)
         pp_group = get_pp_group()
@@ -1771,15 +2645,15 @@ class NPUModelRunner(GPUModelRunner):
                 # hit a KeyError. Reset prev_num_draft_len to 0 for such
                 # requests so they fall through safely.
                 if (
-                    self.use_async_scheduling
-                    and self.num_spec_tokens
-                    and self.input_batch.prev_req_id_to_index is not None
+                        self.use_async_scheduling
+                        and self.num_spec_tokens
+                        and self.input_batch.prev_req_id_to_index is not None
                 ):
                     for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                         if (
-                            req_id not in self.input_batch.prev_req_id_to_index
-                            and (req_state := self.requests.get(req_id)) is not None
-                            and req_state.prev_num_draft_len
+                                req_id not in self.input_batch.prev_req_id_to_index
+                                and (req_state := self.requests.get(req_id)) is not None
+                                and req_state.prev_num_draft_len
                         ):
                             req_state.prev_num_draft_len = 0
 
@@ -1789,10 +2663,10 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
-                    self._start_dump_data()
+                    self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                     with self.maybe_get_ec_connector_output(
-                        scheduler_output,
-                        encoder_cache=self.encoder_cache,
+                            scheduler_output,
+                            encoder_cache=self.encoder_cache,
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
                         self._finalize_dump_data()
@@ -1800,8 +2674,8 @@ class NPUModelRunner(GPUModelRunner):
 
                 if not num_scheduled_tokens:
                     if (
-                        self.parallel_config.distributed_executor_backend == "external_launcher"
-                        and self.parallel_config.data_parallel_size > 1
+                            self.parallel_config.distributed_executor_backend == "external_launcher"
+                            and self.parallel_config.data_parallel_size > 1
                     ):
                         # this is a corner case when both external launcher
                         # and DP are enabled, num_scheduled_tokens could be
@@ -1829,7 +2703,7 @@ class NPUModelRunner(GPUModelRunner):
                     if not has_kv_transfer_group():
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-                self._start_dump_data()
+                self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 (
@@ -1840,7 +2714,13 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
-
+                debug_kv_cache_token_rows = []
+                # 如果开启KV debug，生成本次step的token_rows元数据
+                if self._should_collect_kv_cache_stats():
+                    debug_kv_cache_token_rows = self._make_debug_token_rows(
+                        num_scheduled_tokens_np,
+                        total_num_scheduled_tokens,
+                    )
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -1952,9 +2832,9 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
-                    cudagraph_mode == CUDAGraphMode.FULL
-                    or (enable_sp() and not self.model_config.use_mla)
-                    and self.dcp_size == 1
+                        cudagraph_mode == CUDAGraphMode.FULL
+                        or (enable_sp() and not self.model_config.use_mla)
+                        and self.dcp_size == 1
                 ):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
@@ -2020,7 +2900,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         defer_kv_connector_finalize = self.speculative_config is not None and (
-            get_pp_group().is_last_rank or self.broadcast_pp_output
+                get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         with (
             record_function_or_nullcontext("forward"),
@@ -2041,7 +2921,7 @@ class NPUModelRunner(GPUModelRunner):
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
-                    {"defer_finalize": defer_kv_connector_finalize}
+                        {"defer_finalize": defer_kv_connector_finalize}
                 ),
             ) as kv_connector_output,
         ):
@@ -2111,6 +2991,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                debug_kv_cache_token_rows,  # 存入ExecuteModelState NamedTuple
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2122,7 +3003,7 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def sample_tokens(
-        self, grammar_output: "GrammarOutput | None"
+            self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -2156,6 +3037,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            debug_kv_cache_token_rows,  # 从execute_model_state取出
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2203,15 +3085,15 @@ class NPUModelRunner(GPUModelRunner):
         early_pp_padded_drafter = False
         if self.speculative_config:
             use_padded_batch = (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
-                or self.speculative_config.use_ngram_gpu()
-            ) and not self.speculative_config.disable_padded_drafter_batch
+                                       self.speculative_config.use_eagle()
+                                       or self.speculative_config.uses_draft_model()
+                                       or self.speculative_config.uses_extract_hidden_states()
+                                       or self.speculative_config.use_ngram_gpu()
+                               ) and not self.speculative_config.disable_padded_drafter_batch
             early_pp_padded_drafter = (
-                use_pp_spec_decode
-                and not self.use_async_scheduling
-                and use_padded_batch
+                    use_pp_spec_decode
+                    and not self.use_async_scheduling
+                    and use_padded_batch
             )
             if early_pp_padded_drafter:
                 self._draft_token_ids = None
@@ -2285,7 +3167,7 @@ class NPUModelRunner(GPUModelRunner):
             routed_experts=None,
         )
         if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
-            self, "_execution_start_time"
+                self, "_execution_start_time"
         ):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
@@ -2315,7 +3197,7 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
             return model_runner_output
-        
+
         # Async path: produce a device-side snapshot that the async
         # copy stream can D2H later. Both tensors must be private
         # clones because:
@@ -2338,7 +3220,22 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
-        async_output = AsyncGPUModelRunnerOutput(
+        kv_cache_stats_fn = None
+        kv_cache_stats_stream = None
+        kv_cache_copy_stream = None
+        # 如果开启KV Cache统计，先drain上一轮pending outputs，再获取streams，partial包装快照函数
+        if self._should_collect_kv_cache_stats():
+            self._drain_ready_debug_kv_cache_outputs()
+            kv_cache_stats_stream, kv_cache_copy_stream = self._get_debug_kv_cache_streams()
+            kv_cache_stats_fn = partial(
+                self._make_debug_kv_cache_snapshot,
+                attn_metadata,
+                scheduler_output,
+                debug_kv_cache_token_rows,
+            )
+        # 根据是否有kv_cache_stats_fn选择输出类：AsyncNPUModelRunnerOutput / 父类
+        async_output_cls = AsyncNPUModelRunnerOutput if kv_cache_stats_fn else AsyncGPUModelRunnerOutput
+        async_output = async_output_cls(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -2346,6 +3243,18 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
             routed_experts=routed_experts_snapshot,
+            # 只有开启debug时，才传入kv cache相关参数
+            **(
+                {
+                    "kv_cache_stats_fn": kv_cache_stats_fn,
+                    "kv_cache_stats_stream": kv_cache_stats_stream,
+                    "kv_cache_copy_stream": kv_cache_copy_stream,
+                    "kv_cache_pending_output_fn": self._add_pending_debug_kv_cache_output,
+                    "kv_cache_stomp_check_fn": self._check_debug_kv_cache_stomp,
+                }
+                if kv_cache_stats_fn
+                else {}
+            ),
         )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
@@ -2390,13 +3299,13 @@ class NPUModelRunner(GPUModelRunner):
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
     def _bookkeeping_sync(
-        self,
-        scheduler_output: "SchedulerOutput",
-        sampler_output: SamplerOutput,
-        logits: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
-        spec_decode_metadata: SpecDecodeMetadata | None,
+            self,
+            scheduler_output: "SchedulerOutput",
+            sampler_output: SamplerOutput,
+            logits: torch.Tensor | None,
+            hidden_states: torch.Tensor,
+            num_scheduled_tokens: int,
+            spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
         LogprobsLists | None,
         list[list[int]],
@@ -2553,14 +3462,14 @@ class NPUModelRunner(GPUModelRunner):
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
 
     def _update_full_graph_params_if_needed(
-        self,
-        forward_context: ForwardContext,
-        num_tokens_padded: int,
+            self,
+            forward_context: ForwardContext,
+            num_tokens_padded: int,
     ) -> None:
         if (
-            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-            and not self.use_sparse and not self.use_compress
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not forward_context.capturing
+                and not self.use_sparse and not self.use_compress
         ):
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
@@ -2575,13 +3484,13 @@ class NPUModelRunner(GPUModelRunner):
             )
 
     def _model_forward(
-        self,
-        num_tokens_padded: int,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
+            self,
+            num_tokens_padded: int,
+            input_ids: torch.Tensor | None = None,
+            positions: torch.Tensor | None = None,
+            intermediate_tensors: IntermediateTensors | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
         forward_context = get_forward_context()
@@ -2622,10 +3531,10 @@ class NPUModelRunner(GPUModelRunner):
     # must be skipped. Both overrides use enable_sp() rather than
     # is_residual_scattered_for_sp() to reflect the actual Ascend SP state.
     def sync_and_slice_intermediate_tensors(
-        self,
-        num_tokens: int,
-        intermediate_tensors: IntermediateTensors | None,
-        sync_self: bool,
+            self,
+            num_tokens: int,
+            intermediate_tensors: IntermediateTensors | None,
+            sync_self: bool,
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
         tp = self.vllm_config.parallel_config.tensor_parallel_size
@@ -2653,10 +3562,10 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def sync_and_gather_intermediate_tensors(
-        self,
-        num_tokens: int,
-        intermediate_tensors: IntermediateTensors | None,
-        sync_self: bool,
+            self,
+            num_tokens: int,
+            intermediate_tensors: IntermediateTensors | None,
+            sync_self: bool,
     ) -> IntermediateTensors:
         # vllm renamed sync_and_slice to sync_and_gather.
         # The Ascend override logic is identical: skip the upstream all_gather
@@ -2666,28 +3575,28 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _determine_batch_execution_and_padding(
-        self,
-        num_tokens: int,
-        num_reqs: int,
-        num_scheduled_tokens_np: np.ndarray,
-        max_num_scheduled_tokens: int,
-        use_cascade_attn: bool,
-        allow_microbatching: bool = False,
-        force_eager: bool = False,
-        # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
-        # be improved in model runner v2)
-        force_uniform_decode: bool | None = None,
-        force_has_lora: bool | None = None,
-        force_num_active_loras: int | None = None,
-        num_encoder_reqs: int = 0,
+            self,
+            num_tokens: int,
+            num_reqs: int,
+            num_scheduled_tokens_np: np.ndarray,
+            max_num_scheduled_tokens: int,
+            use_cascade_attn: bool,
+            allow_microbatching: bool = False,
+            force_eager: bool = False,
+            # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
+            # be improved in model runner v2)
+            force_uniform_decode: bool | None = None,
+            force_has_lora: bool | None = None,
+            force_num_active_loras: int | None = None,
+            num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
-                (is_all_decode if self.speculative_config else True)
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                    (is_all_decode if self.speculative_config else True)
+                    and (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                    and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -2765,19 +3674,19 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _build_attention_metadata(
-        self,
-        num_tokens: int,
-        num_reqs: int,
-        max_query_len: int,
-        num_tokens_padded: int | None = None,
-        num_reqs_padded: int | None = None,
-        ubatch_slices: UBatchSlices | None = None,
-        logits_indices: torch.Tensor | None = None,
-        use_spec_decode: bool = False,
-        for_cudagraph_capture: bool = False,
-        num_scheduled_tokens: dict[str, int] | None = None,
-        num_scheduled_tokens_np: np.ndarray | None = None,
-        cascade_attn_prefix_lens: list[list[int]] | None = None,
+            self,
+            num_tokens: int,
+            num_reqs: int,
+            max_query_len: int,
+            num_tokens_padded: int | None = None,
+            num_reqs_padded: int | None = None,
+            ubatch_slices: UBatchSlices | None = None,
+            logits_indices: torch.Tensor | None = None,
+            use_spec_decode: bool = False,
+            for_cudagraph_capture: bool = False,
+            num_scheduled_tokens: dict[str, int] | None = None,
+            num_scheduled_tokens_np: np.ndarray | None = None,
+            cascade_attn_prefix_lens: list[list[int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2798,7 +3707,6 @@ class NPUModelRunner(GPUModelRunner):
             max_seq_len = self.max_model_len
         else:
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
-
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -2823,7 +3731,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         def _get_block_table_and_slot_mapping(
-            kv_cache_gid: int,
+                kv_cache_gid: int,
         ):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
@@ -2903,9 +3811,9 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             context_parallel_metadata=self.long_seq_metadata,
-            group_len = self.group_len.gpu[:num_reqs_padded],
-            group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
-            group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
+            group_len=self.group_len.gpu[:num_reqs_padded],
+            group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
+            group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -2913,13 +3821,13 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
         def _build_attn_group_metadata(
-            kv_cache_gid: int,
-            attn_gid: int,
-            common_attn_metadata: CommonAttentionMetadata,
-            prefill_ratio_to_sas_metadata: dict,
-            decode_ratio_to_sas_metadata: dict,
-            common_ratio_to_sas_metadata: dict,
-            ubid: int | None = None,
+                kv_cache_gid: int,
+                attn_gid: int,
+                common_attn_metadata: CommonAttentionMetadata,
+                prefill_ratio_to_sas_metadata: dict,
+                decode_ratio_to_sas_metadata: dict,
+                common_ratio_to_sas_metadata: dict,
+                ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -2950,9 +3858,9 @@ class NPUModelRunner(GPUModelRunner):
 
             if (for_cudagraph_capture
                     and not isinstance(builder, (
-                        AscendDSAMetadataBuilder,
-                        AscendDSACPMetadataBuilder,
-                        AscendSFADCPMetadataBuilder,
+                            AscendDSAMetadataBuilder,
+                            AscendDSACPMetadataBuilder,
+                            AscendSFADCPMetadataBuilder,
                     ))):
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
@@ -2964,7 +3872,7 @@ class NPUModelRunner(GPUModelRunner):
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
                 if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() \
-                    and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
+                        and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
             if isinstance(builder, AscendDSAMetadataBuilder):
@@ -3020,8 +3928,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer 
-                    | AscendDSparkProposer):
+                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer
+                                            | AscendDSparkProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -3056,7 +3964,7 @@ class NPUModelRunner(GPUModelRunner):
                     _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
         if spec_decode_common_attn_metadata is not None and (
-            num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
+                num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
         ):
             # Currently the drafter still only uses piecewise cudagraphs (and modifies
             # the attention metadata in directly), and therefore does not want to use
@@ -3065,10 +3973,10 @@ class NPUModelRunner(GPUModelRunner):
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _should_build_dummy_attn_metadata(
-        self,
-        force_attention: bool = False,
-        is_profile: bool = False,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+            self,
+            force_attention: bool = False,
+            is_profile: bool = False,
+            cudagraph_runtime_mode: CUDAGraphMode | None = None,
     ) -> bool:
         """
         Determine whether attention metadata should be built during dummy_run.
@@ -3080,21 +3988,21 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _dummy_run(
-        self,
-        num_tokens: int,
-        with_prefill: bool = False,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        force_attention: bool = False,
-        uniform_decode: bool = False,
-        is_profile: bool = False,
-        create_mixed_batch: bool = False,
-        allow_microbatching: bool = True,
-        skip_eplb: bool = False,
-        remove_lora: bool = True,
-        is_graph_capturing: bool = False,
-        num_active_loras: int = 0,
-        profile_seq_lens: int | None = None,
-        profile_cpp: bool = False,
+            self,
+            num_tokens: int,
+            with_prefill: bool = False,
+            cudagraph_runtime_mode: CUDAGraphMode | None = None,
+            force_attention: bool = False,
+            uniform_decode: bool = False,
+            is_profile: bool = False,
+            create_mixed_batch: bool = False,
+            allow_microbatching: bool = True,
+            skip_eplb: bool = False,
+            remove_lora: bool = True,
+            is_graph_capturing: bool = False,
+            num_active_loras: int = 0,
+            profile_seq_lens: int | None = None,
+            profile_cpp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3184,10 +4092,10 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        
+
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
-        
+
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
@@ -3229,11 +4137,11 @@ class NPUModelRunner(GPUModelRunner):
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
                 cum_num_tokens = self._get_cumsum_and_arange(
-                num_scheduled_tokens, self.query_pos.np)
-                self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    num_scheduled_tokens, self.query_pos.np)
+                self.query_start_loc.np[1: num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    self.gdn_query_start_loc.np[1: num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -3272,14 +4180,14 @@ class NPUModelRunner(GPUModelRunner):
                         blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens,
-            num_sampled_tokens,
-            remove_lora,
-            # TODO: The next line is a temporary workaround
-            # to fix the accuracy issue of test_llama32_lora.py,
-            # which is introduced by vllm-project/vllm#32005
-            num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
+                self.lora_config,
+                num_scheduled_tokens,
+                num_sampled_tokens,
+                remove_lora,
+                # TODO: The next line is a temporary workaround
+                # to fix the accuracy issue of test_llama32_lora.py,
+                # which is introduced by vllm-project/vllm#32005
+                num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
@@ -3337,18 +4245,18 @@ class NPUModelRunner(GPUModelRunner):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
             with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-                has_sinks = self._has_sinks,
-                input_ids=input_ids,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
+                    aclgraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    model_instance=self.model,
+                    has_sinks=self._has_sinks,
+                    input_ids=input_ids,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3383,8 +4291,8 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _dummy_sampler_run(
-        self,
-        hidden_states: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         output = None
 
@@ -3404,7 +4312,7 @@ class NPUModelRunner(GPUModelRunner):
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
+                mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         super().profile_run()
@@ -3426,7 +4334,7 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_heat_collection_status = num_tokens_padded <= self.eplb_pd_thresholds
         else:
             # collect eplb heat for all requests.
-            self.eplb_heat_collection_status =  True
+            self.eplb_heat_collection_status = True
 
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
@@ -3437,6 +4345,7 @@ class NPUModelRunner(GPUModelRunner):
             # remove this part after the mix placement merged into vllm
             def mock_true():
                 return True
+
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
             rocm_aiter_ops.is_fused_moe_enabled = mock_true
 
@@ -3444,6 +4353,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.eplb_enable:
                 def mock_pass(param1, param2):
                     return
+
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
@@ -3506,17 +4416,17 @@ class NPUModelRunner(GPUModelRunner):
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
-        logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+        logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2 ** 30))
 
         get_offloader().post_init()
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
-            supports_multimodal_pruning(self.get_model())
-            and mm_config is not None
-            and mm_config.is_multimodal_pruning_enabled()
-        ) # type: bool
-        
+                supports_multimodal_pruning(self.get_model())
+                and mm_config is not None
+                and mm_config.is_multimodal_pruning_enabled()
+        )  # type: bool
+
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
@@ -3537,10 +4447,10 @@ class NPUModelRunner(GPUModelRunner):
             load_model_total_time,
         )
 
-    def _start_dump_data(self) -> None:
+    def _start_dump_data(self, **kwargs) -> None:
         if self.debugger is None or self._debugger_started:
             return
-        self.debugger.start(self.model)
+        self.debugger.start(self.model, **kwargs)
         self._debugger_started = True
 
     def _finalize_dump_data(self, **kwargs) -> None:
@@ -3577,12 +4487,12 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         if (
-            self.speculative_config
-            and self.drafter is not None
-            and (
+                self.speculative_config
+                and self.drafter is not None
+                and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
-            )
+        )
         ):
             assert isinstance(
                 self.drafter,
@@ -3611,7 +4521,7 @@ class NPUModelRunner(GPUModelRunner):
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
         offset = (aligned_addr - data_ptr) // tensor.element_size()
-        return tensor[int(offset) :]
+        return tensor[int(offset):]
 
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -3707,9 +4617,9 @@ class NPUModelRunner(GPUModelRunner):
         return (value + alignment - 1) // alignment * alignment
 
     def _allocate_int8_cache_tensor(
-        self,
-        numel: int,
-        alignment: int,
+            self,
+            numel: int,
+            alignment: int,
     ) -> torch.Tensor:
         """Allocate an int8 raw cache tensor.
 
@@ -3730,11 +4640,11 @@ class NPUModelRunner(GPUModelRunner):
         return self._align_memory(raw_tensor, alignment)[:numel]
 
     def _allocate_sparse_c8_indexer_tensors(
-        self,
-        dsa_k_tensor_size: int,
-        dsa_k_scale_tensor_size: int,
-        alignment: int,
-        scale_dtype: torch.dtype,
+            self,
+            dsa_k_tensor_size: int,
+            dsa_k_scale_tensor_size: int,
+            alignment: int,
+            scale_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Allocate dsa_k and dsa_k_scale from one aligned int8 raw allocation.
 
@@ -3774,7 +4684,7 @@ class NPUModelRunner(GPUModelRunner):
 
         dsa_k_tensor = sparse_c8_raw_tensor[:dsa_k_tensor_size]
         dsa_k_scale_tensor = sparse_c8_raw_tensor[
-            scale_offset : scale_offset + dsa_k_scale_tensor_size
+            scale_offset: scale_offset + dsa_k_scale_tensor_size
         ]
 
         assert dsa_k_tensor.is_contiguous()
@@ -3821,10 +4731,10 @@ class NPUModelRunner(GPUModelRunner):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
-                    "linear_attn" in layer_name
-                    or self.hybrid_with_attn_and_mamba
-                    or "cache_only_layers" in layer_name
-                    or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
+                        "linear_attn" in layer_name
+                        or self.hybrid_with_attn_and_mamba
+                        or "cache_only_layers" in layer_name
+                        or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
                 ) and layer_name not in kv_cache_raw_tensors:
                     # for mamba linear attention, attn-linear hybrid, or cache_only_layers (extract_hidden_states)
                     if self.vllm_config.kv_transfer_config is None:
@@ -3840,8 +4750,8 @@ class NPUModelRunner(GPUModelRunner):
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
                     if self.vllm_config.kv_transfer_config is None:
                         tensor = torch.zeros(kv_cache_tensor.size,
-                                                dtype=torch.int8,
-                                                device=self.device)
+                                             dtype=torch.int8,
+                                             device=self.device)
                     else:
                         cache_size_aligned = kv_cache_tensor.size + alignment
                         tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
@@ -3850,28 +4760,28 @@ class NPUModelRunner(GPUModelRunner):
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif (
-                    isinstance(layer_kv_cache_spec[layer_name], AscendSFAIndexerCacheSpec)
-                    and layer_name not in kv_cache_raw_tensors
+                        isinstance(layer_kv_cache_spec[layer_name], AscendSFAIndexerCacheSpec)
+                        and layer_name not in kv_cache_raw_tensors
                 ):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     raw_cache: tuple[torch.Tensor, ...]
                     num_blocks = kv_cache_tensor.size // current_kv_cache_spec.page_size_bytes
                     k_tensor_size = (
-                        num_blocks
-                        * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
-                        * current_kv_cache_spec.block_size
-                        * current_kv_cache_spec.num_kv_heads
-                        * current_kv_cache_spec.head_size
-                        * get_dtype_size(current_kv_cache_spec.dtype)
-                    )
-                    if current_kv_cache_spec.scale_dim:
-                        scale_tensor_size = (
                             num_blocks
                             * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
                             * current_kv_cache_spec.block_size
                             * current_kv_cache_spec.num_kv_heads
-                            * current_kv_cache_spec.scale_dim
-                            * get_dtype_size(current_kv_cache_spec.scale_dtype)
+                            * current_kv_cache_spec.head_size
+                            * get_dtype_size(current_kv_cache_spec.dtype)
+                    )
+                    if current_kv_cache_spec.scale_dim:
+                        scale_tensor_size = (
+                                num_blocks
+                                * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
+                                * current_kv_cache_spec.block_size
+                                * current_kv_cache_spec.num_kv_heads
+                                * current_kv_cache_spec.scale_dim
+                                * get_dtype_size(current_kv_cache_spec.scale_dtype)
                         )
                         k_tensor, scale_tensor = self._allocate_sparse_c8_indexer_tensors(
                             dsa_k_tensor_size=k_tensor_size,
@@ -3952,12 +4862,12 @@ class NPUModelRunner(GPUModelRunner):
         return kv_cache_raw_tensors
 
     def _adjust_kv_layout(
-        self,
-        raw_tensor: torch.Tensor,
-        kv_cache_shape_list: list[int],
-        kv_cache_dtype_list: list[int],
-        page_size_bytes: int,
-        overlap_full_kv_cache: bool = False,
+            self,
+            raw_tensor: torch.Tensor,
+            kv_cache_shape_list: list[int],
+            kv_cache_dtype_list: list[int],
+            page_size_bytes: int,
+            overlap_full_kv_cache: bool = False,
     ):
         reshaped_kv_tensors = []
         base_storage_offset_bytes = raw_tensor.storage_offset()
@@ -3967,7 +4877,7 @@ class NPUModelRunner(GPUModelRunner):
                 storage_offset_bytes = base_storage_offset_bytes
             dtype_size = get_dtype_size(dtype)
             num_element_per_page = (
-                page_size_bytes // dtype_size
+                    page_size_bytes // dtype_size
             )
 
             stride = torch.empty(shape).stride()
@@ -3983,11 +4893,10 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
-
     def _reshape_kv_cache_tensors(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
+            self,
+            kv_cache_config: KVCacheConfig,
+            kv_cache_raw_tensors: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -4032,10 +4941,10 @@ class NPUModelRunner(GPUModelRunner):
                     if hasattr(current_kv_cache_spec, "scale_dim") and current_kv_cache_spec.scale_dim != 0:
                         indexer_k_shape = kv_cache_shape
                         indexer_scale_shape = self.attn_backend.get_kv_cache_shape(
-                                                num_blocks, current_kv_cache_spec.block_size,
-                                                current_kv_cache_spec.num_kv_heads,
-                                                current_kv_cache_spec.scale_dim
-                                                )
+                            num_blocks, current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.scale_dim
+                        )
                         if get_ascend_device_type() in {AscendDeviceType.A5}:
                             indexer_full_shape = self.attn_backend.get_kv_cache_shape(
                                 num_blocks, current_kv_cache_spec.block_size,
@@ -4060,11 +4969,11 @@ class NPUModelRunner(GPUModelRunner):
                             overlap_full_kv_cache = False
 
                     kv_cache = self._adjust_kv_layout(kv_tensor,
-                                           kv_cache_shape_list,
-                                           kv_cache_dtype_list,
-                                           current_kv_cache_spec.page_size_bytes,
-                                           overlap_full_kv_cache=overlap_full_kv_cache,
-                                           )
+                                                      kv_cache_shape_list,
+                                                      kv_cache_dtype_list,
+                                                      current_kv_cache_spec.page_size_bytes,
+                                                      overlap_full_kv_cache=overlap_full_kv_cache,
+                                                      )
 
                     kv_caches[layer_name] = kv_cache
                 elif isinstance(current_kv_cache_spec, AscendSFAIndexerCacheSpec):
@@ -4124,18 +5033,18 @@ class NPUModelRunner(GPUModelRunner):
                             raw_k_tensor, raw_v_tensor = raw_cache
                             sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     elif (
-                        self.use_hybrid_blocks
-                        and self.hybrid_with_attn_and_mamba
-                        and "cache_only_layers" not in layer_name
-                        and not is_hidden_state_cache_spec(current_kv_cache_spec)
+                            self.use_hybrid_blocks
+                            and self.hybrid_with_attn_and_mamba
+                            and "cache_only_layers" not in layer_name
+                            and not is_hidden_state_cache_spec(current_kv_cache_spec)
                     ):
                         # Currently, we ensure that the same kvcache format is used even if there
                         # is no shared layer, such as the full attention mtp layer of qwen3.5, etc.
                         raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name], kv_cache_raw_tensors[layer_name]
                         sum_page_size_bytes = raw_k_tensor.numel()
                     elif (
-                        "cache_only_layers" in layer_name
-                        or is_hidden_state_cache_spec(current_kv_cache_spec)
+                            "cache_only_layers" in layer_name
+                            or is_hidden_state_cache_spec(current_kv_cache_spec)
                     ):
                         # Single tensor for extract_hidden_states (no K/V split)
                         raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -4376,7 +5285,7 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) 
+                )
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
                 max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
@@ -4423,15 +5332,15 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_spec: KVCacheSpec
 
         def get_attn_backends_for_group(
-            kv_cache_group_spec: KVCacheGroupSpec,
+                kv_cache_group_spec: KVCacheGroupSpec,
         ) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:
             layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase, kv_cache_group_spec.layer_names)
             attn_backends = {}
             attn_backend_layers = defaultdict(list)
 
             def backend_supports_kernel_block_size(
-                attn_backend: type[AttentionBackend],
-                block_size: int,
+                    attn_backend: type[AttentionBackend],
+                    block_size: int,
             ) -> bool:
                 for supported_size in attn_backend.get_supported_kernel_block_sizes():
                     if isinstance(supported_size, int):
@@ -4457,11 +5366,11 @@ class NPUModelRunner(GPUModelRunner):
                 # indexer-cache layers require their own metadata builder.
                 attn_backend = layers[layer_name].get_attn_backend()
                 if (
-                    isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec)
-                    and not backend_supports_kernel_block_size(
-                        attn_backend,
-                        layer_kv_cache_spec.block_size,
-                    )
+                        isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec)
+                        and not backend_supports_kernel_block_size(
+                    attn_backend,
+                    layer_kv_cache_spec.block_size,
+                )
                 ):
                     from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 
@@ -4476,7 +5385,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         def create_attn_groups(
-            attn_backends_map: dict[AttentionBackend, list[str]], kv_cache_group_id: int
+                attn_backends_map: dict[AttentionBackend, list[str]], kv_cache_group_id: int
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
@@ -4568,8 +5477,8 @@ class NPUModelRunner(GPUModelRunner):
                         dtype = self.c8_k_cache_dtype
                     else:
                         head_size = (
-                            self.model_config.hf_text_config.kv_lora_rank
-                            + self.model_config.hf_text_config.qk_rope_head_dim
+                                self.model_config.hf_text_config.kv_lora_rank
+                                + self.model_config.hf_text_config.qk_rope_head_dim
                         )
                         dtype = self.kv_cache_dtype
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
@@ -4654,15 +5563,15 @@ class NPUModelRunner(GPUModelRunner):
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
-        self,
-        attention_backends: list[set[type[AttentionBackend]]],
-        kv_cache_groups: list[KVCacheGroupSpec],
+            self,
+            attention_backends: list[set[type[AttentionBackend]]],
+            kv_cache_groups: list[KVCacheGroupSpec],
     ) -> None:
         min_cg_support = AttentionCGSupport.ALWAYS
         min_cg_attn_backend = None
 
         for attn_backend_set, kv_cache_group in zip(
-            attention_backends, kv_cache_groups
+                attention_backends, kv_cache_groups
         ):
             for attn_backend in attn_backend_set:
                 builder_cls = attn_backend.get_builder_cls()
@@ -4688,12 +5597,12 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if (
-            self.speculative_config
-            and self.drafter is not None
-            and (
+                self.speculative_config
+                and self.drafter is not None
+                and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_extract_hidden_states()
-            )
+        )
         ):
             assert isinstance(
                 self.drafter,
